@@ -10,9 +10,16 @@ No send, delete, move, or modify functions exist by design.
 
 import asyncio
 import logging
-from datetime import datetime
+import os
+import platform
+import time as _time
+from datetime import datetime, timedelta
+from pathlib import Path
+import google_mail
 
 log = logging.getLogger("jarvis.mail")
+IS_MAC = platform.system() == "Darwin"
+IS_LINUX = platform.system() == "Linux"
 
 _mail_launched = False
 
@@ -90,6 +97,9 @@ end tell
 
 
 async def get_unread_count() -> dict:
+    if IS_LINUX:
+        return await google_mail.get_unread_count()
+    
     """Get unread message count per account and total.
 
     Returns: {"total": int, "accounts": {"Google": 5, "Work": 3, ...}}
@@ -126,6 +136,9 @@ end tell
 
 
 async def get_recent_messages(count: int = 10) -> list[dict]:
+    if IS_LINUX:
+        return await google_mail.get_recent_messages(count)
+    
     """Get most recent messages from unified inbox.
 
     Returns list of {"sender", "subject", "date", "read", "account", "preview"}.

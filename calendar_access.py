@@ -8,11 +8,15 @@ filter dates in Python. Results cached and refreshed in background.
 import asyncio
 import logging
 import os
+import platform
 import time as _time
 from datetime import datetime, timedelta
 from pathlib import Path
+import google_calendar
 
 log = logging.getLogger("jarvis.calendar")
+IS_MAC = platform.system() == "Darwin"
+IS_LINUX = platform.system() == "Linux"
 
 # Calendars to scan — set CALENDAR_ACCOUNTS env var to a comma-separated list,
 # or leave empty to auto-discover ALL calendars from Apple Calendar.
@@ -182,6 +186,9 @@ async def refresh_cache():
 
 
 async def get_todays_events() -> list[dict]:
+    if IS_LINUX:
+        return await google_calendar.get_todays_events()
+    
     """Get today's events from cache. Returns cached data immediately."""
     if not _event_cache and _cache_time == 0:
         # First call — try a quick refresh

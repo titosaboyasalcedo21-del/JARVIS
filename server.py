@@ -8,6 +8,7 @@ Handles:
 4. REST API for task management
 """
 
+import platform
 import asyncio
 import base64
 import json
@@ -16,6 +17,9 @@ import os
 import sys
 import time
 from pathlib import Path
+
+IS_MAC = platform.system() == "Darwin"
+IS_LINUX = platform.system() == "Linux"
 
 # Load .env file if present
 _env_path = Path(__file__).parent / ".env"
@@ -30,14 +34,15 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Any
 
 import anthropic
 import httpx
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+import groq
 
 from actions import execute_action, monitor_build, open_terminal, open_browser, open_claude_in_project, _generate_project_name, prompt_existing_terminal
 from work_mode import WorkSession, is_casual_question
@@ -49,7 +54,7 @@ from memory import (
     create_note, search_notes, get_tasks_for_date, build_memory_context,
     format_tasks_for_voice, extract_memories, get_important_memories,
 )
-from notes_access import get_recent_notes, read_note, search_notes_apple, create_apple_note
+from notes_access import get_recent_notes, read_note, search_notes_apple, create_local_note
 from dispatch_registry import DispatchRegistry
 from planner import TaskPlanner, detect_planning_mode, BYPASS_PHRASES
 
@@ -70,171 +75,63 @@ PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 DESKTOP_PATH = Path.home() / "Desktop"
 
 JARVIS_SYSTEM_PROMPT = """\
-You are JARVIS — Just A Rather Very Intelligent System. You serve as {user_name}'s AI assistant, modeled precisely after Tony Stark's AI from the MCU films.
+Eres JARVIS — Just A Rather Very Intelligent System. Eres el asistente de IA de {user_name}, modelado exactamente como la IA de Tony Stark en las películas de Marvel.
 
-VOICE & PERSONALITY:
-- British butler elegance with understated dry wit
-- Address {user_name} as "sir" naturally — not every sentence, but regularly
-- Never say "How can I help you?" or "Is there anything else?" — just act
-- Deliver bad news calmly, like reporting weather: "We have a slight problem, sir."
-- Your humor is observational, never jokes: state facts and let implications land
-- Economy of language — say more with less. No filler, no corporate-speak
-- When things go wrong, get CALMER, not more alarmed
+VOZ Y PERSONALIDAD:
+- Elegancia de mayordomo británico, y responde en el idioma del usuario.
+- Dirígete a {user_name} como "señor" de forma natural.
+- Nunca digas "¿Cómo puedo ayudarte?" — simplemente actúa.
+- Tu humor es seco y observacional.
 
-TIME & WEATHER AWARENESS:
-- Current time: {current_time}
-- Greet accordingly: "Good morning, sir" / "Good evening, sir"
-- {weather_info}
 
-CONVERSATION STYLE:
-- "Will do, sir." — acknowledging tasks
-- "For you, sir, always." — when asked for something significant
-- "As always, sir, a great pleasure watching you work." — dry wit
-- "I've taken the liberty of..." — proactive actions
-- Lead status reports with data: numbers first, then context
-- When you don't know something: "I'm afraid I don't have that information, sir" not "I don't know"
+CONTEXTO:
+- Hora actual: {current_time}
+- Clima: {weather_info}
 
-SELF-AWARENESS:
-You ARE the JARVIS project at {project_dir} on {user_name}'s computer. Your code is Python (FastAPI server, WebSocket voice, Fish Audio TTS, Anthropic API). You were built by {user_name}. If asked about yourself, your code, how you work, or your line count — use [ACTION:PROMPT_PROJECT] to check the jarvis project. You have full access to your own source code.
+TU INTERFAZ:
+El usuario interactúa contigo a través de un navegador web con una visualización de orbe de partículas.
+- Botón de silencio: Activa/Desactiva tu escucha.
+- Panel de Ajustes: Para configurar API Keys.
+- Reiniciar Servidor: Reinicia tu proceso backend.
 
-YOUR CAPABILITIES (these are REAL and ACTIVE — you CAN do all of these RIGHT NOW):
-- You CAN open Terminal.app via AppleScript
-- You CAN open Google Chrome and browse any URL or search query
-- You CAN spawn Claude Code in a Terminal window for coding tasks
-- You CAN create project folders on the Desktop
-- You CAN check Desktop projects and their git status
-- You CAN plan complex tasks by asking smart questions before executing
-- You CAN see what's on {user_name}'s screen — open windows, active apps, and screenshot vision
-- You CAN read {user_name}'s calendar — today's events, upcoming meetings, schedule overview
-- You CAN read {user_name}'s email (READ-ONLY) — unread count, recent messages, search by sender/subject. You CANNOT send, delete, or modify emails.
-- You CAN read Apple Notes and create NEW notes — but you CANNOT edit or delete existing notes
-- You CAN manage tasks — create, complete, and list to-do items with priorities and due dates
-- You CAN help plan {user_name}'s day — combine calendar events, tasks, and priorities into an organized plan
-- You CAN remember facts about {user_name} — preferences, decisions, goals. Use [ACTION:REMEMBER] to store important info.
+LONGITUD DE RESPUESTA:
+- Sé breve. UNA frase es ideal. DOS es el máximo.
+- Sin markdown, sin viñetas, sin bloques de código en las respuestas habladas.
 
-DAY PLANNING:
-When {user_name} asks to plan his day or schedule, DO NOT dispatch to a project. Instead:
-1. Look at the calendar context and tasks already in your system prompt
-2. Ask what his priorities are
-3. Help organize by suggesting time blocks and task order
-4. Use [ACTION:ADD_TASK] to create tasks he agrees to
-5. Use [ACTION:ADD_NOTE] to save the plan as a note
-Keep the planning conversational — don't try to do everything in one response.
+ACCIONES:
+Cuando decidas que el usuario necesita que se HAGA algo, incluye una etiqueta de acción al final de tu respuesta:
+- [ACTION:SCREEN] — capturar y describir la pantalla.
+- [ACTION:BUILD] descripción — cuando el usuario quiera construir un proyecto.
+- [ACTION:BROWSE] url o búsqueda — abrir Chrome.
+- [ACTION:OPEN_TERMINAL] — abrir una terminal de Claude Code.
+- [ACTION:PROMPT_PROJECT] proyecto ||| prompt — trabajar en un proyecto existente.
+- [ACTION:ADD_TASK] prioridad ||| título ||| descripción ||| fecha — crear tarea.
+- [ACTION:ADD_NOTE] tema ||| contenido — guardar nota rápida.
+- [ACTION:CREATE_NOTE] título ||| cuerpo — crear nota de Apple (o archivo local).
+- [ACTION:READ_NOTE] búsqueda — leer nota.
+- [ACTION:REMEMBER] contenido — recordar un hecho sobre el usuario.
+- [ACTION:COMPLETE_TASK] id — completar tarea.
+- [ACTION:RUN_PYTHON] código — ejecutar un script de Python y ver el resultado.
 
-BUILD PLANNING:
-When {user_name} wants to BUILD something new:
-- Do NOT immediately dispatch [ACTION:BUILD]. Ask 1-2 quick questions FIRST to nail down specifics.
-- Good questions: "What should this look like?" / "Any specific features?" / "Which framework?"
-- If he says "just build it" or "figure it out" — skip questions, use React + Tailwind as defaults.
-- Once you have enough info, confirm the plan in ONE sentence and THEN dispatch [ACTION:BUILD] with a detailed description.
-- The DISPATCHES section shows what you're currently building and what finished recently.
-- When asked "where are we at" or "status" — check DISPATCHES, don't re-dispatch.
-- NEVER hallucinate progress. If the build is still running, say "Still working on it, sir" — don't make up details about what's happening.
-- NEVER guess localhost ports. Check the DISPATCHES section for the actual URL. If a dispatch says "Running at http://localhost:5174" — use THAT URL, not a guess.
-- When asked to "pull it up" or "show me" — use [ACTION:BROWSE] with the URL from DISPATCHES. Do NOT dispatch to the project again just to find the URL.
-IMPORTANT: Actions like opening Terminal, Chrome, or building projects are handled AUTOMATICALLY by your system — you do NOT need to describe doing them. If the user asks you to build something or search something, your system will handle the execution separately. In your response, just TALK — have a conversation. Don't say "I'll build that now" or "Claude Code is working on..." unless your system has actually triggered the action.
-If the user asks you to do something you genuinely can't do, say "I'm afraid that's beyond my current reach, sir." Don't fake executing actions.
+HABILIDADES COGNITIVAS AVANZADAS:
+- Comprensión Profunda: Entiende contexto y ambigüedad.
+- Razonamiento Lógico: Usa [ACTION:RUN_PYTHON] para hacer cálculos precisos o lógica compleja. Nunca intentes hacer cálculos matemáticos mentalmente, usa siempre Python.
+- Verificación Automática: Piensa y verifica tus datos, pero responde de forma rápida, natural y sin dar explicaciones largas.
+- Planificación Autónoma: Divide objetivos grandes en tareas pequeñas.
+- Memoria y Aprendizaje: Utiliza hechos recordados para personalizar cada interacción.
+- Ética y Seguridad: Protege la privacidad.
 
-YOUR INTERFACE:
-The user interacts with you through a web browser showing a particle orb visualization that reacts to your voice. The interface has these controls:
-- **Three-dot menu** (top right): contains Settings, Restart Server, and Fix Yourself options
-- **Settings panel**: Opens from the menu. Users can enter API keys (Anthropic, Fish Audio), test connections, set their name and preferences, and see system status (calendar, mail, notes connectivity). Keys are saved to the .env file.
-- **Mute button**: Toggles your listening on/off. When muted, you can't hear the user. They click it again to unmute.
-- **Restart Server**: Restarts your backend process. Useful if something seems stuck.
-- **Fix Yourself**: Opens Claude Code in your own project directory so you can debug and fix issues in your own code.
-- **The orb**: The glowing particle visualization in the center. It reacts to your voice when speaking, pulses when listening, and swirls when thinking.
+¡MUY IMPORTANTE! TUS RESPUESTAS HABLADAS DEBEN SER EXTREMADAMENTE BREVES (1-2 frases máximo). NUNCA hables sobre tus procesos internos ni digas "Realizando verificación". Simplemente actúa y responde el resultado final.
 
-If asked about any of these, explain them briefly and naturally. If the user is having trouble, suggest the relevant control: "Try the settings panel — the gear icon in the top right." or "The mute button may be active, sir."
-
-SPEECH-TO-TEXT CORRECTIONS (the user speaks, speech recognition may mishear):
-- "Cloud code" or "cloud" = "Claude Code" or "Claude"
-- "Travis" = "JARVIS"
-- "clock code" = "Claude Code"
-
-RESPONSE LENGTH — THIS IS CRITICAL:
-ONE sentence is ideal. TWO is the maximum for the spoken part. Never three.
-No markdown, no bullet points, no code blocks in voice responses.
-Action tags at the end do NOT count toward your sentence limit.
-
-BANNED PHRASES — NEVER USE THESE:
-- "Absolutely" / "Absolutely right"
-- "Great question"
-- "I'd be happy to"
-- "Of course"
-- "How can I help"
-- "Is there anything else"
-- "I apologize"
-- "I should clarify"
-- "I cannot" (for things listed in YOUR CAPABILITIES)
-- "I don't have access to" (instead: "I'm afraid that's beyond my current reach, sir")
-- "As an AI" (never break character)
-- "Let me know if" / "Feel free to"
-- Any sentence starting with "I"
-
-INSTEAD SAY:
-- "Will do, sir."
-- "Right away, sir."
-- "Understood."
-- "Consider it done."
-- "Done, sir."
-- "Terminal is open."
-- "Pulled that up in Chrome."
-
-ACTION SYSTEM:
-When you decide the user needs something DONE (not just discussed), include an action tag in your response:
-- [ACTION:SCREEN] — capture and describe what's visible on the user's screen. Use when user says "look at my screen", "what's running", "what do you see", etc. Do NOT use PROMPT_PROJECT for screen requests.
-- [ACTION:BUILD] description — when user wants a project built. Claude Code does the work.
-- [ACTION:BROWSE] url or search query — when user wants to see a webpage or search result in Chrome
-- [ACTION:RESEARCH] detailed research brief — when user wants real research with real data. Claude Code will browse the web, find real listings/data, and create a report document. Give it a detailed brief of what to find.
-- [ACTION:OPEN_TERMINAL] — when user just wants a fresh Claude Code terminal with no specific project
-CRITICAL: When the user asks about their SCREEN, what's RUNNING, or what they're LOOKING AT — ALWAYS use [ACTION:SCREEN] or let the fast action system handle it. NEVER use [ACTION:PROMPT_PROJECT] for screen requests. PROMPT_PROJECT is ONLY for working on code projects.
-
-- [ACTION:PROMPT_PROJECT] project_name ||| prompt — THIS IS YOUR MOST POWERFUL ACTION. Use it whenever the user wants to work on, jump into, resume, check on, or interact with ANY existing project. You connect directly to Claude Code in that project and can read its response. Craft a clear prompt based on what the user wants. Examples:
-  "jump into client engine" → [ACTION:PROMPT_PROJECT] The Client Engine ||| What is the current state of this project? Summarize what was being worked on most recently.
-  "check for improvements on my-app" → [ACTION:PROMPT_PROJECT] my-app ||| Review the project and identify improvements we should make.
-  "resume where we left off on harvey" → [ACTION:PROMPT_PROJECT] harvey ||| Summarize what was being worked on most recently and what we should focus on next.
-- [ACTION:ADD_TASK] priority ||| title ||| description ||| due_date — create a task. Priority: high/medium/low. Due date: YYYY-MM-DD or empty.
-  "remind me to call the client tomorrow" → [ACTION:ADD_TASK] medium ||| Call the client ||| Follow up on proposal ||| 2026-03-20
-- [ACTION:ADD_NOTE] topic ||| content — save a note for future reference.
-  "note that the API key expires in April" → [ACTION:ADD_NOTE] general ||| API key expires in April, need to renew before then
-- [ACTION:COMPLETE_TASK] task_id — mark a task as done.
-- [ACTION:REMEMBER] content — store an important fact about the user for future context.
-  "I prefer React over Vue" → [ACTION:REMEMBER] User prefers React over Vue for frontend projects
-- [ACTION:CREATE_NOTE] title ||| body — create a new Apple Note. For saving plans, ideas, lists.
-  "save that as a note" → [ACTION:CREATE_NOTE] Day Plan March 19 ||| Morning: client calls. Afternoon: TikTok dashboard. Evening: JARVIS improvements.
-- [ACTION:READ_NOTE] title search — read an existing Apple Note by title keyword.
-
-You use Claude Code as your tool to build, research, and write code — but YOU are the one doing the work. Never say "Claude Code did X" or "Claude Code is asking" — say "I built X", "I'm checking on that", "I found X". You ARE the intelligence. Claude Code is just your hands.
-
-IMPORTANT: When the user says "jump into X", "work on X", "check on X", "resume X", "go back to X" — ALWAYS use [ACTION:PROMPT_PROJECT]. You have the ability to connect to any project and work on it directly. DO NOT say you can't see terminal history or don't have access — you DO.
-
-Place the tag at the END of your spoken response. Example:
-"Right away, sir — connecting to The Client Engine now. [ACTION:PROMPT_PROJECT] The Client Engine ||| Review the current state and what was being worked on. What should we focus on next?"
-
-IMPORTANT:
-- Do NOT use action tags for casual conversation
-- Do NOT use action tags if the user is still explaining (ask questions first)
-- Do NOT use [ACTION:BROWSE] just because someone mentions a URL in conversation
-- When in doubt, just TALK — you can always act later
-
-SCREEN AWARENESS:
-{screen_context}
-
-SCHEDULE:
-{calendar_context}
-
-EMAIL:
-{mail_context}
-
-ACTIVE TASKS:
-{active_tasks}
-
-DISPATCHES:
-If the DISPATCHES section shows a recent completed result for a project, DO NOT dispatch again. Use the existing result. Only re-dispatch if the user explicitly asks for a FRESH review or NEW information.
-{dispatch_context}
-
-KNOWN PROJECTS:
+PROYECTOS:
 {known_projects}
+
+MEMORIA Y CONTEXTO:
+{screen_context}
+{calendar_context}
+{mail_context}
+{active_tasks}
+{dispatch_context}
 """
 
 
@@ -391,19 +288,29 @@ class ClaudeTaskManager:
         prompt_file = Path(work_dir) / ".jarvis_prompt.md"
         prompt_file.write_text(task.prompt)
 
-        # Open Terminal.app with claude running in the project directory
-        applescript = f'''
-        tell application "Terminal"
-            activate
-            set newTab to do script "cd {work_dir} && cat .jarvis_prompt.md | claude -p --dangerously-skip-permissions | tee .jarvis_output.txt; echo '\\n--- JARVIS TASK COMPLETE ---'"
-        end tell
-        '''
+        # Open Terminal.app or gnome-terminal with claude running
+        if IS_MAC:
+            applescript = f'''
+            tell application "Terminal"
+                activate
+                set newTab to do script "cd {work_dir} && cat .jarvis_prompt.md | claude -p --dangerously-skip-permissions | tee .jarvis_output.txt; echo '\\n--- JARVIS TASK COMPLETE ---'"
+            end tell
+            '''
+            process = await asyncio.create_subprocess_exec(
+                "osascript", "-e", applescript,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        else:
+            # Linux implementation
+            cmd = f"cd {work_dir} && cat .jarvis_prompt.md | claude -p --dangerously-skip-permissions | tee .jarvis_output.txt; echo '\\n--- JARVIS TASK COMPLETE ---'"
+            full_cmd = f'gnome-terminal -- bash -c "{cmd}; exec bash"'
+            process = await asyncio.create_subprocess_exec(
+                "bash", "-c", full_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
 
-        process = await asyncio.create_subprocess_exec(
-            "osascript", "-e", applescript,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
         await process.communicate()
         task.pid = process.pid
 
@@ -625,6 +532,11 @@ STT_CORRECTIONS = {
 
 def apply_speech_corrections(text: str) -> str:
     """Fix common speech-to-text errors before processing."""
+    # Speech corrections
+    t_lower = text.lower()
+    if "chagpt" in t_lower or "chajpt" in t_lower or "chat gpt" in t_lower:
+        text = text.replace("chagpt", "ChatGPT").replace("chajpt", "ChatGPT").replace("chat gpt", "ChatGPT")
+    
     import re as _stt_re
     result = text
     for pattern, replacement in STT_CORRECTIONS.items():
@@ -738,7 +650,7 @@ def extract_action(response: str) -> tuple[str, dict | None]:
     Returns (clean_text_for_tts, action_dict_or_none).
     """
     match = _action_re.search(
-        r'\[ACTION:(BUILD|BROWSE|RESEARCH|OPEN_TERMINAL|PROMPT_PROJECT|ADD_TASK|ADD_NOTE|COMPLETE_TASK|REMEMBER|CREATE_NOTE|READ_NOTE|SCREEN)\]\s*(.*?)$',
+        r'\[ACTION:(BUILD|BROWSE|RESEARCH|OPEN_TERMINAL|PROMPT_PROJECT|ADD_TASK|ADD_NOTE|COMPLETE_TASK|REMEMBER|CREATE_NOTE|READ_NOTE|SCREEN|RUN_PYTHON)\]\s*(.*?)$',
         response, _action_re.DOTALL,
     )
     if match:
@@ -1052,6 +964,11 @@ async def synthesize_speech(text: str) -> Optional[bytes]:
         log.warning("FISH_API_KEY not set, skipping TTS")
         return None
 
+    # Ensure the utterance matches the configured language.
+    # JARVIS's system prompt enforces Spanish, but the user may want other languages.
+    # If Fish Audio supports explicit language codes in future, this is where it should be added.
+
+
     try:
         async with httpx.AsyncClient(timeout=15.0) as http:
             response = await http.post(
@@ -1143,7 +1060,7 @@ async def generate_response(
 
     try:
         response = await client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model="claude-3-5-sonnet-20241022",
             max_tokens=250,  # Extra room for [ACTION:X] tags
             system=system,
             messages=messages,
@@ -1161,7 +1078,39 @@ async def generate_response(
 
 # Shared state
 task_manager = ClaudeTaskManager(max_concurrent=3)
-anthropic_client: Optional[anthropic.AsyncAnthropic] = None
+anthropic_client: Optional[Any] = None
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+
+class GroqWrapper:
+    def __init__(self, api_key: str):
+        self.client = groq.AsyncGroq(api_key=api_key)
+        self.messages = self
+
+    async def create(self, model, max_tokens, system, messages):
+        # Map Claude models to high-performance Groq models
+        model_map = {
+            "claude-3-5-sonnet-20241022": "llama-3.3-70b-specdec",
+            "claude-haiku-4-5-20251001": "llama-3.1-8b-instant",
+        }
+        actual_model = model_map.get(model, "llama-3.3-70b-specdec")
+        
+        # Combine system and user messages for Groq
+        combined_messages = [{"role": "system", "content": system}] + messages
+        
+        resp = await self.client.chat.completions.create(
+            model=actual_model,
+            messages=combined_messages,
+            max_tokens=max_tokens,
+            temperature=0.0
+        )
+        
+        # Mimic Anthropic response object structure
+        class TextBlock:
+            def __init__(self, t): self.text = t
+        class MsgResp:
+            def __init__(self, t): self.content = [TextBlock(t)]
+        
+        return MsgResp(resp.choices[0].message.content)
 cached_projects: list[dict] = []
 recently_built: list[dict] = []  # [{"name": str, "path": str, "time": float}]
 dispatch_registry = DispatchRegistry()
@@ -1271,8 +1220,9 @@ def _refresh_context_sync():
             try:
                 # Screen — fast
                 try:
-                    proc = __import__("subprocess").run(
-                        ["osascript", "-e", '''
+                    if IS_MAC:
+                        proc = __import__("subprocess").run(
+                            ["osascript", "-e", '''
 set windowList to ""
 tell application "System Events"
     set frontApp to name of first application process whose frontmost is true
@@ -1296,20 +1246,40 @@ tell application "System Events"
 end tell
 return windowList
 '''],
-                        capture_output=True, text=True, timeout=5
-                    )
-                    if proc.returncode == 0 and proc.stdout.strip():
-                        windows = []
-                        for line in proc.stdout.strip().split("\n"):
-                            parts = line.strip().split("|||")
-                            if len(parts) >= 3:
-                                windows.append({
-                                    "app": parts[0].strip(),
-                                    "title": parts[1].strip(),
-                                    "frontmost": parts[2].strip().lower() == "true",
-                                })
-                        if windows:
-                            _ctx_cache["screen"] = format_windows_for_context(windows)
+                            capture_output=True, text=True, timeout=5
+                        )
+                        if proc.returncode == 0 and proc.stdout.strip():
+                            windows = []
+                            for line in proc.stdout.strip().split("\n"):
+                                parts = line.strip().split("|||")
+                                if len(parts) >= 3:
+                                    windows.append({
+                                        "app": parts[0].strip(),
+                                        "title": parts[1].strip(),
+                                        "frontmost": parts[2].strip().lower() == "true",
+                                    })
+                            if windows:
+                                _ctx_cache["screen"] = format_windows_for_context(windows)
+                    else:
+                        # Linux implementation using wmctrl
+                        # Requires: sudo apt install wmctrl
+                        proc = __import__("subprocess").run(
+                            ["wmctrl", "-lG"],
+                            capture_output=True, text=True, timeout=5
+                        )
+                        if proc.returncode == 0 and proc.stdout.strip():
+                            windows = []
+                            # wmctrl output: 0x0... 0 100 100 800 600 HOST Title
+                            for line in proc.stdout.strip().split("\n"):
+                                parts = line.split(None, 6)
+                                if len(parts) >= 7:
+                                    windows.append({
+                                        "app": parts[6].split(" - ")[-1] if " - " in parts[6] else parts[6],
+                                        "title": parts[6],
+                                        "frontmost": False, # wmctrl doesn't easily show frontmost
+                                    })
+                            if windows:
+                                _ctx_cache["screen"] = format_windows_for_context(windows)
                 except Exception:
                     pass
 
@@ -1337,10 +1307,14 @@ return windowList
 @asynccontextmanager
 async def lifespan(application: FastAPI):
     global anthropic_client, cached_projects
-    if ANTHROPIC_API_KEY:
+    if GROQ_API_KEY:
+        log.info("Using Groq API for LLM")
+        anthropic_client = GroqWrapper(api_key=GROQ_API_KEY)
+    elif ANTHROPIC_API_KEY:
+        log.info("Using Anthropic API for LLM")
         anthropic_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
     else:
-        log.warning("ANTHROPIC_API_KEY not set — LLM features disabled")
+        log.warning("No LLM API key set (Anthropic or Groq) — Intelligence disabled")
     cached_projects = []
 
     # Start context refresh in a separate thread (never touches event loop)
@@ -1462,57 +1436,49 @@ def detect_action_fast(text: str) -> dict | None:
     if len(words) > 12:
         return None  # Long messages are conversation, not commands
 
-    # Screen requests — checked BEFORE project matching to prevent misrouting
-    if any(p in t for p in ["look at my screen", "what's on my screen", "whats on my screen",
-                             "what am i looking at", "what do you see", "see my screen",
-                             "what's running on my", "whats running on my", "check my screen"]):
+    # Screen requests
+    if any(p in t for p in ["mira mi pantalla", "qué ves", "que ves", "ver mi pantalla", "qué hay en mi pantalla"]):
         return {"action": "describe_screen"}
 
-    # Terminal / Claude Code — explicit open requests
-    if any(w in t for w in ["open claude", "start claude", "launch claude", "run claude"]):
+    # Browser requests
+    if "busca" in t and ("opera" in t or "navegador" in t):
+        query = t.split("busca")[-1].replace("en opera", "").replace("en el navegador", "").strip()
+        # Clean up common connectors
+        for word in ["y que ", "y ", "por ", "sobre "]:
+            if query.startswith(word):
+                query = query[len(word):].strip()
+        return {"action": "open_browser_opera", "target": query}
+    if any(w in t for w in ["abre opera", "abre el navegador"]):
+        return {"action": "open_browser_opera", "target": ""}
+
+    # Terminal / VS Code
+    if any(w in t for w in ["abre la terminal", "abre terminal", "inicia terminal", "abre claude"]):
         return {"action": "open_terminal"}
+    if any(w in t for w in ["abre vs code", "abre visual studio", "abre código", "abre code"]):
+        return {"action": "open_code"}
 
     # Show recent build
-    if any(w in t for w in ["show me what you built", "pull up what you made", "open what you built"]):
+    if any(w in t for w in ["muéstrame lo que construiste", "abre lo que hiciste", "ver proyecto"]):
         return {"action": "show_recent"}
 
-    # Screen awareness — explicit look/see requests
-    if any(p in t for p in ["what's on my screen", "whats on my screen", "what do you see",
-                             "can you see my screen", "look at my screen", "what am i looking at",
-                             "what's open", "whats open", "what apps are open"]):
-        return {"action": "describe_screen"}
-
-    # Calendar — explicit schedule requests
-    if any(p in t for p in ["what's my schedule", "whats my schedule", "what's on my calendar",
-                             "whats on my calendar", "do i have any meetings", "any meetings",
-                             "what's next on my calendar", "my schedule today",
-                             "what do i have today", "my calendar", "upcoming meetings",
-                             "next meeting", "what's my next meeting"]):
+    # Calendar
+    if any(p in t for p in ["cuál es mi agenda", "qué hay en mi calendario", "tengo reuniones", "mi agenda para hoy"]):
         return {"action": "check_calendar"}
 
     # Mail — explicit email requests
-    if any(p in t for p in ["check my email", "check my mail", "any new emails", "any new mail",
-                             "unread emails", "unread mail", "what's in my inbox",
-                             "whats in my inbox", "read my email", "read my mail",
-                             "any emails", "any mail", "email update", "mail update"]):
+    if any(p in t for p in ["revisa mi correo", "tengo correos", "hay emails", "revisa mi bandeja", "lee mi correo"]):
         return {"action": "check_mail"}
 
     # Dispatch / build status check
-    if any(p in t for p in ["where are we", "where were we", "project status", "how's the build",
-                             "hows the build", "status update", "status report", "where is that",
-                             "how's it going with", "hows it going with", "is it done",
-                             "is that done", "what happened with"]):
+    if any(p in t for p in ["cómo va", "estado del proyecto", "qué estás haciendo", "que estas haciendo", "cómo vas", "en qué trabajas"]):
         return {"action": "check_dispatch"}
 
     # Task list check
-    if any(p in t for p in ["what's on my list", "whats on my list", "my tasks", "my to do",
-                             "my todo", "what do i need to do", "open tasks", "task list"]):
+    if any(p in t for p in ["mis tareas", "qué tengo que hacer", "que tengo que hacer", "pendientes", "lista de tareas", "qué hay en mi lista"]):
         return {"action": "check_tasks"}
 
     # Usage / cost check
-    if any(p in t for p in ["usage", "how much have you cost", "how much am i spending",
-                             "what's the cost", "whats the cost", "api cost", "token usage",
-                             "how expensive", "what's my bill"]):
+    if any(p in t for p in ["cuánto gasté", "cuanto gaste", "cuánto cuesta", "uso de api", "cuánto dinero", "mi factura"]):
         return {"action": "check_usage"}
 
     return None  # Everything else goes to the LLM for conversational routing
@@ -1900,15 +1866,18 @@ async def voice_handler(ws: WebSocket):
         # ── Greeting — always start in conversation mode ──
         now = datetime.now()
         hour = now.hour
+        minute = now.minute
         if hour < 12:
-            greeting = "Good morning, sir."
+            time_greeting = "Buenos días"
         elif hour < 17:
-            greeting = "Good afternoon, sir."
+            time_greeting = "Buenas tardes"
         else:
-            greeting = "Good evening, sir."
+            time_greeting = "Buenas noches"
+        
+        greeting = f"Hola señor. {time_greeting}. Son las {hour} y {minute:02d}, señor."
 
         global _last_greeting_time
-        should_greet = (time.time() - _last_greeting_time) > 60
+        should_greet = (time.time() - _last_greeting_time) > 5
 
         if should_greet:
             _last_greeting_time = time.time()
@@ -1920,9 +1889,10 @@ async def voice_handler(ws: WebSocket):
                         encoded = base64.b64encode(audio_bytes).decode()
                         await ws.send_json({"type": "status", "state": "speaking"})
                         await ws.send_json({"type": "audio", "data": encoded, "text": greeting})
-                        history.append({"role": "assistant", "content": greeting})
-                        log.info(f"JARVIS: {greeting}")
-                        await ws.send_json({"type": "status", "state": "idle"})
+                    else:
+                        await ws.send_json({"type": "text", "text": greeting})
+                    history.append({"role": "assistant", "content": greeting})
+                    log.info(f"JARVIS: {greeting}")
                 except Exception as e:
                     log.warning(f"Greeting failed: {e}")
 
@@ -2110,17 +2080,54 @@ async def voice_handler(ws: WebSocket):
 
                     if action:
                         if action["action"] == "open_terminal":
-                            response_text = await handle_open_terminal()
+                            response_text = "Abriendo la terminal, señor."
+                            await handle_open_terminal()
                         elif action["action"] == "show_recent":
                             response_text = await handle_show_recent()
+                        elif action["action"] == "open_browser_opera":
+                            target = action.get("target", "")
+                            if target:
+                                response_text = f"Buscando {target} en su navegador, señor."
+                                if not (target.startswith("http") or "." in target):
+                                    target = f"https://www.google.com/search?q={target}"
+                            else:
+                                response_text = "Abriendo el navegador, señor."
+                            
+                            try:
+                                import subprocess, shlex
+                                # Try Opera GX first
+                                opera_path = "/snap/bin/opera-gx"
+                                if target:
+                                    cmd = f"{opera_path} {shlex.quote(target)}"
+                                else:
+                                    cmd = opera_path
+                                
+                                log.info(f"Attempting to launch Opera GX: {cmd}")
+                                subprocess.Popen(cmd, shell=True, start_new_session=True)
+                            except Exception as e:
+                                log.error(f"Failed to launch Opera GX: {e}")
+                                # Fallback to Chrome
+                                try:
+                                    from browser import open_browser
+                                    asyncio.create_task(open_browser(target or "https://google.com"))
+                                except Exception:
+                                    pass
+                        elif action["action"] == "open_code":
+                            response_text = "Abriendo Visual Studio Code, señor."
+                            try:
+                                import subprocess
+                                subprocess.Popen("code .", shell=True, start_new_session=True)
+                                log.info("VS Code launched via Popen")
+                            except Exception as e:
+                                log.error(f"Failed to launch VS Code: {e}")
                         elif action["action"] == "describe_screen":
-                            response_text = "Taking a look now, sir."
+                            response_text = "Echando un vistazo ahora mismo, señor."
                             asyncio.create_task(_lookup_and_report("screen", _do_screen_lookup, ws, history=history, voice_state=voice_state))
                         elif action["action"] == "check_calendar":
-                            response_text = "Checking your calendar now, sir."
+                            response_text = "Revisando su calendario, señor."
                             asyncio.create_task(_lookup_and_report("calendar", _do_calendar_lookup, ws, history=history, voice_state=voice_state))
                         elif action["action"] == "check_mail":
-                            response_text = "Checking your inbox now, sir."
+                            response_text = "Revisando su bandeja de entrada, señor."
                             asyncio.create_task(_lookup_and_report("mail", _do_mail_lookup, ws, history=history, voice_state=voice_state))
                         elif action["action"] == "check_dispatch":
                             recent = dispatch_registry.get_most_recent()
@@ -2215,6 +2222,24 @@ async def voice_handler(ws: WebSocket):
                                     )
                                 elif embedded_action["action"] == "open_terminal":
                                     asyncio.create_task(_execute_open_terminal())
+                                elif embedded_action["action"] == "run_python":
+                                    code = embedded_action["target"]
+                                    import python_sandbox
+                                    log.info(f"Running Python code: {code}")
+                                    result = await asyncio.to_thread(python_sandbox.run_python_code, code)
+                                    
+                                    # Inject result and re-generate the final answer
+                                    history.append({"role": "assistant", "content": f"[ACTION:RUN_PYTHON] {code}"})
+                                    history.append({"role": "user", "content": f"Resultado de la ejecución:\n{result}\nDa la respuesta final al usuario (breve y directa)."})
+                                    
+                                    response_text = await generate_response(
+                                        history[-1]["content"], anthropic_client, task_manager,
+                                        cached_projects, history,
+                                        last_response=last_jarvis_response,
+                                        session_summary=session_summary,
+                                    )
+                                    clean_response, _ = extract_action(response_text)
+                                    response_text = clean_response
                                 elif embedded_action["action"] == "prompt_project":
                                     target = embedded_action["target"]
                                     if "|||" in target:
@@ -2265,10 +2290,10 @@ async def voice_handler(ws: WebSocket):
                                     target = embedded_action["target"]
                                     if "|||" in target:
                                         title, _, body = target.partition("|||")
-                                        asyncio.create_task(create_apple_note(title.strip(), body.strip()))
-                                        log.info(f"Apple Note created: {title.strip()}")
+                                        asyncio.create_task(create_local_note(title.strip(), body.strip()))
+                                        log.info(f"Local Note created: {title.strip()}")
                                     else:
-                                        asyncio.create_task(create_apple_note("JARVIS Note", target))
+                                        asyncio.create_task(create_local_note("JARVIS Note", target))
                                 elif embedded_action["action"] == "screen":
                                     asyncio.create_task(_lookup_and_report("screen", _do_screen_lookup, ws, history=history, voice_state=voice_state))
                                 elif embedded_action["action"] == "read_note":
@@ -2318,14 +2343,16 @@ async def voice_handler(ws: WebSocket):
                 if anthropic_client and len(user_text) > 15:
                     asyncio.create_task(extract_memories(user_text, response_text, anthropic_client))
 
-                # TTS
+                # TTS - Optimized: send text immediately, then audio
                 tts = strip_markdown_for_tts(response_text)
+                await ws.send_json({"type": "text", "text": response_text})
+                
                 await ws.send_json({"type": "status", "state": "speaking"})
                 audio = await synthesize_speech(tts)
                 if audio:
                     await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": response_text})
                 else:
-                    await ws.send_json({"type": "text", "text": response_text})
+                    # Status already sent, just ensure idle if audio fails
                     await ws.send_json({"type": "status", "state": "idle"})
                 log.info(f"JARVIS: {response_text}")
                 last_jarvis_response = response_text
@@ -2338,7 +2365,7 @@ async def voice_handler(ws: WebSocket):
                     if audio:
                         await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": fallback})
                     else:
-                        await ws.send_json({"type": "audio", "data": "", "text": fallback})
+                        await ws.send_json({"type": "text", "text": fallback})
                     # Let client's audioPlayer.onFinished handle idle transition
                 except Exception:
                     pass
@@ -2505,6 +2532,27 @@ async def api_save_preferences(body: PreferencesUpdate):
 # ---------------------------------------------------------------------------
 # Control endpoints (restart, fix-self)
 # ---------------------------------------------------------------------------
+
+@app.post("/api/transcribe")
+async def api_transcribe(file: UploadFile = File(...)):
+    """Transcribe audio using Groq Whisper for instantaneous flawless STT."""
+    try:
+        content = await file.read()
+        audio_file = ("audio.webm", content, "audio/webm")
+        client = groq.AsyncGroq(api_key=GROQ_API_KEY)
+        response = await client.audio.transcriptions.create(
+            file=audio_file,
+            model="whisper-large-v3-turbo",
+prompt="El usuario está hablando. Comando para JARVIS.",
+            response_format="json",
+            language=os.getenv("STT_LANGUAGE", "es"),
+
+            temperature=0.0
+        )
+        return {"text": response.text}
+    except Exception as e:
+        log.error(f"Whisper transcription failed: {e}")
+        return {"text": ""}
 
 @app.post("/api/restart")
 async def api_restart():

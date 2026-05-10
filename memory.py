@@ -93,6 +93,15 @@ def init_db():
 # Memories — facts JARVIS learns
 # ---------------------------------------------------------------------------
 
+def _get_chroma():
+    try:
+        import chromadb
+        client = chromadb.PersistentClient(path=str(DB_PATH.parent / "chroma"))
+        return client.get_or_create_collection(name="jarvis_memories")
+    except Exception as e:
+        log.warning(f"ChromaDB not ready yet: {e}. Falling back to SQLite FTS.")
+        return None
+
 def remember(content: str, mem_type: str = "fact", source: str = "", importance: int = 5) -> int:
     """Store a memory. Returns the memory ID."""
     conn = _get_db()
@@ -101,7 +110,20 @@ def remember(content: str, mem_type: str = "fact", source: str = "", importance:
         (mem_type, content, source, importance, time.time())
     )
     mem_id = cur.lastrowid
-    # Update FTS
+    
+    # Try Vector Search first
+    col = _get_chroma()
+    if col:
+        try:
+            col.add(
+                documents=[content],
+                metadatas=[{"type": mem_type, "source": source, "importance": importance, "db_id": mem_id}],
+                ids=[str(mem_id)]
+            )
+        except Exception as e:
+            log.error(f"ChromaDB add error: {e}")
+            
+    # Always update FTS as fallback
     conn.execute(
         "INSERT INTO memory_fts (rowid, content, type, source) VALUES (?, ?, ?, ?)",
         (mem_id, content, mem_type, source)
@@ -114,33 +136,51 @@ def remember(content: str, mem_type: str = "fact", source: str = "", importance:
 
 def _sanitize_fts_query(query: str) -> str:
     """Clean a query string for FTS5 — remove special characters that break it."""
-    # Remove apostrophes, quotes, and FTS operators
     cleaned = query.replace("'", "").replace('"', "").replace("*", "").replace("-", " ")
-    # Take meaningful words only
     words = [w for w in cleaned.split() if len(w) > 2]
     if not words:
         return ""
-    # Join with OR for broader matching
     return " OR ".join(words[:5])
 
 
 def recall(query: str, limit: int = 5) -> list[dict]:
-    """Search memories by relevance. Returns most relevant matches."""
-    fts_query = _sanitize_fts_query(query)
-    if not fts_query:
-        return []
+    """Search memories by relevance using Vector Search (ChromaDB) with FTS fallback."""
     conn = _get_db()
-    try:
-        results = conn.execute("""
-            SELECT m.id, m.type, m.content, m.importance, m.created_at, m.access_count
-            FROM memory_fts f
-            JOIN memories m ON f.rowid = m.id
-            WHERE memory_fts MATCH ?
-            ORDER BY rank
-            LIMIT ?
-        """, (fts_query, limit)).fetchall()
-    except Exception:
-        results = []
+    results = []
+    
+    col = _get_chroma()
+    if col:
+        try:
+            vector_res = col.query(query_texts=[query], n_results=limit)
+            if vector_res["ids"] and vector_res["ids"][0]:
+                mem_ids = vector_res["ids"][0]
+                placeholders = ",".join("?" * len(mem_ids))
+                # Fetch keeping the semantic order
+                id_to_row = {}
+                rows = conn.execute(
+                    f"SELECT m.id, m.type, m.content, m.importance, m.created_at, m.access_count FROM memories m WHERE id IN ({placeholders})",
+                    tuple(mem_ids)
+                ).fetchall()
+                for r in rows: id_to_row[str(r["id"])] = r
+                results = [id_to_row[i] for i in mem_ids if i in id_to_row]
+        except Exception as e:
+            log.error(f"ChromaDB query error: {e}")
+            
+    # Fallback to SQLite FTS if vector search is empty or unavailable
+    if not results:
+        fts_query = _sanitize_fts_query(query)
+        if fts_query:
+            try:
+                results = conn.execute("""
+                    SELECT m.id, m.type, m.content, m.importance, m.created_at, m.access_count
+                    FROM memory_fts f
+                    JOIN memories m ON f.rowid = m.id
+                    WHERE memory_fts MATCH ?
+                    ORDER BY rank
+                    LIMIT ?
+                """, (fts_query, limit)).fetchall()
+            except Exception:
+                pass
 
     # Update access counts
     for r in results:

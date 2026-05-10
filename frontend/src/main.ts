@@ -86,6 +86,10 @@ const voiceInput = createVoiceInput(
     audioPlayer.stop();
     // User spoke — send transcript
     socket.send({ type: "transcript", text, isFinal: true });
+    // Note: We don't need to transition to thinking here, because onThinking was already called.
+  },
+  () => {
+    // onThinking: VAD detected silence, now transcribing via Whisper
     transition("thinking");
   },
   (msg: string) => {
@@ -135,7 +139,10 @@ socket.onMessage((msg) => {
       transition("idle");
     }
   } else if (type === "text") {
-    // Text fallback when TTS fails
+    if (msg.text) {
+      transition("speaking");
+      audioPlayer.speakText(msg.text as string);
+    }
     console.log("[JARVIS]", msg.text);
   } else if (type === "task_spawned") {
     console.log("[task]", "spawned:", msg.task_id, msg.prompt);
