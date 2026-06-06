@@ -26,16 +26,17 @@ JARVIS connects to your Apple Calendar, Mail, and Notes. It can browse the web, 
 - **Plans your day** -- combines calendar, tasks, and priorities into a plan
 - **Sees your screen** -- knows what apps are open for context-aware responses
 - **Audio-reactive orb** -- a Three.js particle visualization that pulses with JARVIS's voice
+- **Siri-style overlay** -- launch JARVIS without opening Chrome using the Linux overlay helper
 
 ## Requirements
 
 - **macOS** (uses AppleScript for Calendar, Mail, Notes integration)
 - **Python 3.11+**
-- **Node.js 18+**
-- **Google Chrome** (required for Web Speech API)
 - **Anthropic API key** -- powers the AI brain ([get one here](https://console.anthropic.com/))
 - **Fish Audio API key** -- powers the voice ([get one here](https://fish.audio/))
 - **Claude Code CLI** -- for spawning dev tasks ([install here](https://docs.anthropic.com/en/docs/claude-code))
+
+> Note: The browser-based frontend is optional. The primary interaction mode is the Linux overlay orb.
 
 ## Quick Start (with Claude Code)
 
@@ -63,23 +64,21 @@ cp .env.example .env
 # 3. Install Python dependencies
 pip install -r requirements.txt
 
-# 4. Install frontend dependencies
-cd frontend && npm install && cd ..
-
-# 5. Generate SSL certificates (needed for secure WebSocket)
+# 4. Generate SSL certificates (needed for secure WebSocket)
 openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes -subj '/CN=localhost'
 
-# 6. Start the backend (Terminal 1)
+# 5. Start the backend (Terminal 1)
 python server.py
 
-# 7. Start the frontend (Terminal 2)
-cd frontend && npm run dev
+# 6. Start the Linux overlay (Terminal 2)
+python desktop-overlay/linux_overlay.py
 
-# 8. Open Chrome
-open http://localhost:5173
+That is all you need. The overlay is the main interface, and no browser is required.
+
+
+This opens a frameless orb window for JARVIS without using a browser.
+
 ```
-
-Click the page once to enable audio, then speak. JARVIS will respond.
 
 ## Configuration
 
@@ -101,7 +100,7 @@ CALENDAR_ACCOUNTS=you@gmail.com,work@company.com
 ## Architecture
 
 ```
-Microphone -> Web Speech API -> WebSocket -> FastAPI -> Claude (Haiku) -> Fish Audio TTS -> WebSocket -> Speaker
+Microphone -> STT input -> WebSocket -> FastAPI -> Claude (Haiku) -> Fish Audio TTS -> WebSocket -> Speaker
                                                 |
                                                 v
                                         Claude Code Tasks
@@ -112,20 +111,20 @@ Microphone -> Web Speech API -> WebSocket -> FastAPI -> Claude (Haiku) -> Fish A
                                         (Calendar, Mail, Notes, Terminal)
 ```
 
-| Layer | Technology |
-|-------|-----------|
-| Backend | FastAPI + Python (`server.py`, ~2300 lines) |
-| Frontend | Vite + TypeScript + Three.js |
-| Communication | WebSocket (JSON messages + binary audio) |
-| AI (fast) | Claude Haiku -- low-latency voice responses |
-| AI (deep) | Claude Opus -- research and complex tasks |
-| TTS | Fish Audio with JARVIS voice model |
-| System | AppleScript for all macOS integrations |
+| Layer         | Technology                                   |
+| ------------- | -------------------------------------------- |
+| Backend       | FastAPI + Python (`server.py`, ~2300 lines)  |
+| Interface     | Linux overlay helper + Three.js particle orb |
+| Communication | WebSocket (JSON messages + binary audio)     |
+| AI (fast)     | Claude Haiku -- low-latency voice responses  |
+| AI (deep)     | Claude Opus -- research and complex tasks    |
+| TTS           | Fish Audio with JARVIS voice model           |
+| System        | AppleScript for all macOS integrations       |
 
 ## How the Voice Loop Works
 
 1. You speak into your microphone
-2. Chrome's Web Speech API transcribes your speech in real-time
+2. Speech transcription is provided by an available STT source and sent to the server via WebSocket
 3. The transcript is sent to the server via WebSocket
 4. JARVIS detects intent -- conversation, action, or build request
 5. For actions: spawns a Claude Code subprocess or runs AppleScript
@@ -137,36 +136,40 @@ Microphone -> Web Speech API -> WebSocket -> FastAPI -> Claude (Haiku) -> Fish A
 
 ## Key Files
 
-| File | Purpose |
-|------|---------|
-| `server.py` | Main server -- WebSocket handler, LLM, action system |
-| `frontend/src/orb.ts` | Three.js particle orb visualization |
-| `frontend/src/voice.ts` | Web Speech API + audio playback |
-| `frontend/src/main.ts` | Frontend state machine |
-| `memory.py` | SQLite memory system with FTS5 full-text search |
-| `calendar_access.py` | Apple Calendar integration via AppleScript |
-| `mail_access.py` | Apple Mail integration (read-only) |
-| `notes_access.py` | Apple Notes integration |
-| `actions.py` | System actions (Terminal, Chrome, Claude Code) |
-| `browser.py` | Playwright web automation |
-| `work_mode.py` | Persistent Claude Code sessions |
-| `planner.py` | Multi-step task planning with smart questions |
+| File                    | Purpose                                              |
+| ----------------------- | ---------------------------------------------------- |
+| `server.py`             | Main server -- WebSocket handler, LLM, action system |
+| `frontend/src/orb.ts`   | Three.js particle orb visualization                  |
+| `frontend/src/voice.ts` | Web Speech API + audio playback                      |
+| `frontend/src/main.ts`  | Frontend state machine                               |
+| `memory.py`             | SQLite memory system with FTS5 full-text search      |
+| `calendar_access.py`    | Apple Calendar integration via AppleScript           |
+| `mail_access.py`        | Apple Mail integration (read-only)                   |
+| `notes_access.py`       | Apple Notes integration                              |
+| `actions.py`            | System actions (Terminal, Chrome, Claude Code)       |
+| `browser.py`            | Playwright web automation                            |
+| `work_mode.py`          | Persistent Claude Code sessions                      |
+| `planner.py`            | Multi-step task planning with smart questions        |
 
 ## Features in Detail
 
 ### Action System
+
 JARVIS uses action tags to trigger real system actions:
+
 - `[ACTION:BUILD]` -- spawns Claude Code to build a project
-- `[ACTION:BROWSE]` -- opens Chrome to a URL or search query
+- `[ACTION:BROWSE]` -- performs research or lookup; may open a browser if explicitly requested
 - `[ACTION:RESEARCH]` -- deep research with Claude Opus, outputs an HTML report
 - `[ACTION:PROMPT_PROJECT]` -- connects to an existing project via Claude Code
 - `[ACTION:ADD_TASK]` -- creates a tracked task with priority and due date
 - `[ACTION:REMEMBER]` -- stores a fact for future context
 
 ### Memory System
+
 JARVIS remembers things you tell it using SQLite with FTS5 full-text search. Preferences, decisions, and facts persist across sessions.
 
 ### Calendar & Mail
+
 All macOS integrations use AppleScript -- no OAuth flows, no token management. Just native system access. Mail is intentionally read-only for safety.
 
 ## Contributing

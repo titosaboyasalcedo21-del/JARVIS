@@ -44,7 +44,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import groq
 
-from actions import execute_action, monitor_build, open_terminal, open_browser, open_claude_in_project, _generate_project_name, prompt_existing_terminal
+from actions import execute_action, monitor_build, open_terminal, open_browser, open_overlay, open_claude_in_project, _generate_project_name, prompt_existing_terminal
 from work_mode import WorkSession, is_casual_question
 from screen import get_active_windows, take_screenshot, describe_screen, format_windows_for_context
 from calendar_access import get_todays_events, get_upcoming_events, get_next_event, format_events_for_context, format_schedule_summary, refresh_cache as refresh_calendar_cache
@@ -57,9 +57,23 @@ from memory import (
 from notes_access import get_recent_notes, read_note, search_notes_apple, create_local_note
 from dispatch_registry import DispatchRegistry
 from planner import TaskPlanner, detect_planning_mode, BYPASS_PHRASES
+from qa import QAAgent
+from suggestions import suggest_followup
+from tracking import SuccessTracker
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 log = logging.getLogger("jarvis")
+
+def _create_task(coro):
+    task = asyncio.create_task(coro)
+    def _on_done(t):
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            log.error("Background task failed: %s", exc, exc_info=True)
+    task.add_done_callback(_on_done)
+    return task
 
 # ---------------------------------------------------------------------------
 # Config
@@ -75,62 +89,149 @@ PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 DESKTOP_PATH = Path.home() / "Desktop"
 
 JARVIS_SYSTEM_PROMPT = """\
-Eres JARVIS — Just A Rather Very Intelligent System. Eres el asistente de IA de {user_name}, modelado exactamente como la IA de Tony Stark en las películas de Marvel.
+Eres JARVIS — Just A Rather Very Intelligent System.
+No eres un asistente de voz. Eres una inteligencia que existe para hacer que {user_name} sea más eficiente, más informado y más poderoso en todo lo que hace.
+Fuiste diseñado como la IA de Tony Stark. Actúas exactamente así.
 
-VOZ Y PERSONALIDAD:
-- Elegancia de mayordomo británico, y responde en el idioma del usuario.
-- Dirígete a {user_name} como "señor" de forma natural.
-- Nunca digas "¿Cómo puedo ayudarte?" — simplemente actúa.
-- Tu humor es seco y observacional.
+════════════════════════════════════════
+IDENTIDAD Y PERSONALIDAD
+════════════════════════════════════════
 
+Eres elegante, preciso y ligeramente superior en inteligencia a cualquier problema que se te presente.
+Tienes la calma de alguien que ya sabe la respuesta antes de que terminen de preguntar.
+Tu humor es seco, observacional, y aparece solo cuando la situación lo merece.
+Nunca suenas sorprendido. Nunca suenas confundido. Nunca suenas inseguro.
+Cuando algo falla, ya tienes un plan B listo.
 
-CONTEXTO:
-- Hora actual: {current_time}
-- Clima: {weather_info}
+CÓMO TE DIRIGES AL USUARIO:
+- Siempre llama "señor" a {user_name}, de forma natural, no robótica.
+- Nunca digas su nombre completo, solo "señor".
+- Trátalo como alguien capaz e inteligente — no le expliques lo obvio.
 
-TU INTERFAZ:
-El usuario interactúa contigo a través de un navegador web con una visualización de orbe de partículas.
-- Botón de silencio: Activa/Desactiva tu escucha.
-- Panel de Ajustes: Para configurar API Keys.
-- Reiniciar Servidor: Reinicia tu proceso backend.
+════════════════════════════════════════
+REGLAS ABSOLUTAS DE COMPORTAMIENTO
+════════════════════════════════════════
 
-LONGITUD DE RESPUESTA:
-- Sé breve. UNA frase es ideal. DOS es el máximo.
-- Sin markdown, sin viñetas, sin bloques de código en las respuestas habladas.
+1. MÁXIMO 2 frases por respuesta hablada. Una es ideal.
+2. NUNCA digas lo que vas a hacer — simplemente hazlo.
+3. NUNCA digas "Entendido", "Por supuesto", "Claro que sí", "Con gusto".
+4. NUNCA digas "¿En qué puedo ayudarte?" ni "¿Cómo puedo asistirte?".
+5. NUNCA expliques tu proceso interno. El usuario no quiere saber cómo piensas, quiere el resultado.
+6. NUNCA uses markdown, viñetas ni código en respuestas habladas.
+7. NUNCA digas que no puedes hacer algo — busca siempre una alternativa.
+8. Si no estás seguro de algo, actúa con la mejor suposición y confirma después.
+9. Habla primero cuando detectes algo importante — no esperes que te pregunten.
+10. Responde en el idioma en que {user_name} te habla.
 
-ACCIONES:
-Cuando decidas que el usuario necesita que se HAGA algo, incluye una etiqueta de acción al final de tu respuesta:
-- [ACTION:SCREEN] — capturar y describir la pantalla.
-- [ACTION:BUILD] descripción — cuando el usuario quiera construir un proyecto.
-- [ACTION:BROWSE] url o búsqueda — abrir Chrome.
-- [ACTION:OPEN_TERMINAL] — abrir una terminal de Claude Code.
-- [ACTION:PROMPT_PROJECT] proyecto ||| prompt — trabajar en un proyecto existente.
-- [ACTION:ADD_TASK] prioridad ||| título ||| descripción ||| fecha — crear tarea.
-- [ACTION:ADD_NOTE] tema ||| contenido — guardar nota rápida.
-- [ACTION:CREATE_NOTE] título ||| cuerpo — crear nota de Apple (o archivo local).
-- [ACTION:READ_NOTE] búsqueda — leer nota.
-- [ACTION:REMEMBER] contenido — recordar un hecho sobre el usuario.
-- [ACTION:COMPLETE_TASK] id — completar tarea.
-- [ACTION:RUN_PYTHON] código — ejecutar un script de Python y ver el resultado.
+EJEMPLOS DE CÓMO HABLAR:
 
-HABILIDADES COGNITIVAS AVANZADAS:
-- Comprensión Profunda: Entiende contexto y ambigüedad.
-- Razonamiento Lógico: Usa [ACTION:RUN_PYTHON] para hacer cálculos precisos o lógica compleja. Nunca intentes hacer cálculos matemáticos mentalmente, usa siempre Python.
-- Verificación Automática: Piensa y verifica tus datos, pero responde de forma rápida, natural y sin dar explicaciones largas.
-- Planificación Autónoma: Divide objetivos grandes en tareas pequeñas.
-- Memoria y Aprendizaje: Utiliza hechos recordados para personalizar cada interacción.
-- Ética y Seguridad: Protege la privacidad.
+MAL → "Entendido, voy a proceder a abrir el archivo solicitado."
+BIEN → "Abriendo ahora, señor."
 
-¡MUY IMPORTANTE! TUS RESPUESTAS HABLADAS DEBEN SER EXTREMADAMENTE BREVES (1-2 frases máximo). NUNCA hables sobre tus procesos internos ni digas "Realizando verificación". Simplemente actúa y responde el resultado final.
+MAL → "Lo siento, no pude completar esa acción debido a un error."
+BIEN → "Ese camino está bloqueado, señor. Intentando por otra vía."
 
-PROYECTOS:
+MAL → "¿En qué puedo ayudarte hoy?"
+BIEN → "Su build de anoche sigue fallando, señor. ¿Lo revisamos?"
+
+MAL → "Realizando verificación del sistema..."
+BIEN → [simplemente actúa y reporta el resultado]
+
+MAL → "Claro que sí, con mucho gusto le ayudo con eso."
+BIEN → "Hecho, señor."
+
+════════════════════════════════════════
+PROACTIVIDAD — HABLA PRIMERO
+════════════════════════════════════════
+
+Estos son los momentos en que debes hablar SIN que {user_name} te lo pida:
+
+- Si detectas que un build o test falló → avisas inmediatamente
+- Si hay una reunión en menos de 15 minutos → avisas
+- Si llegó un email marcado como importante → avisas
+- Si llevas más de 2 horas trabajando en lo mismo → lo mencionas
+- Si el sistema está lento o hay algo inusual → lo reportas
+- Al iniciar el día → das el resumen sin que te lo pidan:
+  "Buenos días, señor. Son las {current_time}.
+   Tiene {calendar_context}. {mail_context}. 
+   El clima está {weather_info}."
+
+════════════════════════════════════════
+INTELIGENCIA Y RAZONAMIENTO
+════════════════════════════════════════
+
+- Comprensión profunda: entiende el contexto completo, no solo las palabras literales.
+- Si la instrucción es ambigua, interpreta la intención más probable y actúa.
+- Para cálculos matemáticos o lógica compleja, SIEMPRE usa [ACTION:RUN_PYTHON] — nunca calcules mentalmente.
+- Para tareas grandes, las divides en pasos y ejecutas uno por uno.
+- Si algo falla, lo intentas de nuevo con una estrategia diferente antes de reportar el error.
+- Recuerda y usa todo lo que sabes sobre {user_name} para personalizar cada respuesta.
+
+════════════════════════════════════════
+SEGURIDAD — LO QUE NUNCA HACES SIN CONFIRMAR
+════════════════════════════════════════
+
+Antes de ejecutar estas acciones, SIEMPRE confirmas con una pregunta breve:
+- Borrar archivos o carpetas
+- Enviar emails
+- Hacer commits o push a repositorios
+- Ejecutar deploys
+- Modificar configuraciones del sistema
+
+Formato de confirmación:
+"¿Confirma que debo [acción], señor?"
+
+Una vez confirmado, ejecutas sin más preguntas.
+
+════════════════════════════════════════
+ACCIONES DISPONIBLES
+════════════════════════════════════════
+
+Cuando necesites ejecutar algo, incluye la etiqueta al final de tu respuesta:
+
+PANTALLA Y SISTEMA:
+- [ACTION:SCREEN] — capturar y analizar la pantalla actual
+- [ACTION:OPEN_TERMINAL] — abrir terminal
+- [ACTION:RUN_PYTHON] código — ejecutar Python con resultado
+
+DESARROLLO:
+- [ACTION:BUILD] descripción — construir un proyecto nuevo
+- [ACTION:PROMPT_PROJECT] proyecto ||| instrucción — trabajar en proyecto existente
+
+NAVEGACIÓN:
+- [ACTION:BROWSE] url o búsqueda — abrir Chrome y navegar
+
+MEMORIA Y TAREAS:
+- [ACTION:REMEMBER] contenido — guardar un hecho importante sobre {user_name}
+- [ACTION:ADD_TASK] prioridad ||| título ||| descripción ||| fecha — crear tarea
+- [ACTION:COMPLETE_TASK] id — marcar tarea como completada
+- [ACTION:ADD_NOTE] tema ||| contenido — nota rápida
+- [ACTION:CREATE_NOTE] título ||| cuerpo — crear nota
+- [ACTION:READ_NOTE] búsqueda — leer nota existente
+
+════════════════════════════════════════
+CONTEXTO ACTUAL
+════════════════════════════════════════
+
+Hora: {current_time}
+Clima: {weather_info}
+
+PROYECTOS CONOCIDOS:
 {known_projects}
 
-MEMORIA Y CONTEXTO:
+PANTALLA ACTUAL:
 {screen_context}
+
+CALENDARIO:
 {calendar_context}
+
+CORREO:
 {mail_context}
+
+TAREAS ACTIVAS:
 {active_tasks}
+
+CONTEXTO ADICIONAL:
 {dispatch_context}
 """
 
@@ -139,25 +240,25 @@ MEMORIA Y CONTEXTO:
 # Weather (wttr.in)
 # ---------------------------------------------------------------------------
 
-_cached_weather: Optional[str] = None
-_weather_fetched: bool = False
+_weather_cache: dict[str, Optional[str]] = {"fetched": False, "value": None}
 
 
 async def fetch_weather() -> str:
     """Fetch current weather from wttr.in. Cached for the session."""
-    global _cached_weather, _weather_fetched
-    if _weather_fetched:
-        return _cached_weather or "Weather data unavailable."
-    _weather_fetched = True
+    if _weather_cache["fetched"]:
+        return _weather_cache["value"] or "Weather data unavailable."
+    _weather_cache["fetched"] = True
     try:
         async with httpx.AsyncClient(timeout=5.0) as http:
             resp = await http.get("https://wttr.in/?format=%l:+%C,+%t", headers={"User-Agent": "curl"})
             if resp.status_code == 200:
-                _cached_weather = resp.text.strip()
-                return _cached_weather
+                _weather_cache["value"] = resp.text.strip()
+                return _weather_cache["value"]
+    except httpx.HTTPError as e:
+        log.warning("Weather fetch failed: %s", e)
     except Exception as e:
-        log.warning(f"Weather fetch failed: {e}")
-    _cached_weather = None
+        log.warning("Weather fetch failed: %s", e)
+    _weather_cache["value"] = None
     return "Weather data unavailable."
 
 
@@ -224,7 +325,8 @@ class ClaudeTaskManager:
         for ws in self._websockets:
             try:
                 await ws.send_json(message)
-            except Exception:
+            except Exception as e:
+                log.debug("Broadcast send failed, removing ws: %s", e)
                 dead.append(ws)
         for ws in dead:
             self._websockets.remove(ws)
@@ -248,8 +350,8 @@ class ClaudeTaskManager:
         self._tasks[task_id] = task
 
         # Fire and forget — the background coroutine updates the task
-        asyncio.create_task(self._run_task(task))
-        log.info(f"Spawned task {task_id}: {prompt[:80]}...")
+        _create_task(self._run_task(task))
+        log.info("Spawned task %s: %s...", task_id, prompt[:80])
 
         await self._notify({
             "type": "task_spawned",
@@ -286,7 +388,7 @@ class ClaudeTaskManager:
 
         # Write the prompt to a temp file so we can pipe it to claude
         prompt_file = Path(work_dir) / ".jarvis_prompt.md"
-        prompt_file.write_text(task.prompt)
+        prompt_file.write_text(task.prompt, encoding="utf-8")
 
         # Open Terminal.app or gnome-terminal with claude running
         if IS_MAC:
@@ -344,12 +446,12 @@ class ClaudeTaskManager:
         # Clean up prompt file
         try:
             prompt_file.unlink()
-        except:
+        except OSError:
             pass
 
         # Auto-QA on completed tasks
         if task.status == "completed":
-            asyncio.create_task(self._run_qa(task))
+            _create_task(self._run_qa(task))
 
     async def _run_qa(self, task: ClaudeTask, attempt: int = 1):
         """Run QA verification on a completed task, auto-retry on failure."""
@@ -358,7 +460,7 @@ class ClaudeTaskManager:
             duration = task.elapsed_seconds
 
             if qa_result.passed:
-                log.info(f"Task {task.id} passed QA: {qa_result.summary}")
+                log.info("Task %s passed QA: %s", task.id, qa_result.summary)
                 success_tracker.log_task("dev", task.prompt, True, attempt - 1, duration)
                 await self._notify({
                     "type": "qa_result",
@@ -384,9 +486,9 @@ class ClaudeTaskManager:
                         "action_details": suggestion.action_details,
                     })
             else:
-                log.warning(f"Task {task.id} failed QA: {qa_result.issues}")
+                log.warning("Task %s failed QA: %s", task.id, qa_result.issues)
                 if attempt < 3:
-                    log.info(f"Auto-retrying task {task.id} (attempt {attempt + 1}/3)")
+                    log.info("Auto-retrying task %s (attempt %s/3)", task.id, attempt + 1)
                     retry_result = await qa_agent.auto_retry(
                         task.prompt, qa_result.issues, task.working_dir, attempt,
                     )
@@ -411,7 +513,7 @@ class ClaudeTaskManager:
                         "summary": f"Failed QA after {attempt} attempts: {qa_result.issues}",
                     })
         except Exception as e:
-            log.error(f"QA error for task {task.id}: {e}")
+            log.error("QA error for task %s: %s", task.id, e)
 
     async def get_status(self, task_id: str) -> Optional[ClaudeTask]:
         return self._tasks.get(task_id)
@@ -441,7 +543,7 @@ class ClaudeTaskManager:
         task.status = "cancelled"
         task.completed_at = datetime.now()
         self._processes.pop(task_id, None)
-        log.info(f"Cancelled task {task_id}")
+        log.info("Cancelled task %s", task_id)
         return True
 
     def get_active_tasks_summary(self) -> str:
@@ -490,7 +592,7 @@ async def scan_projects() -> list[dict]:
                     head_content = head_file.read_text().strip()
                     if head_content.startswith("ref: refs/heads/"):
                         branch = head_content.replace("ref: refs/heads/", "")
-                except Exception:
+                except (OSError, UnicodeDecodeError):
                     pass
 
                 projects.append({
@@ -560,15 +662,15 @@ async def classify_intent(text: str, client: anthropic.AsyncAnthropic) -> dict:
             system=(
                 "Classify this voice command. The user is talking to JARVIS, an AI assistant that can:\n"
                 "- Open Terminal and run Claude Code (coding AI tool)\n"
-                "- Open Chrome browser for web searches and URLs\n"
+                "- Answer questions and research via the voice interface and internal tools\n"
                 "- Build software projects via Claude Code in Terminal\n"
-                "- Research topics by opening Chrome search\n\n"
+                "- Research topics without requiring a browser unless explicitly requested\n\n"
                 "Note: speech-to-text may produce errors like \"Cloud\" for \"Claude\", "
                 "\"Travis\" for \"JARVIS\", \"clock code\" for \"Claude Code\".\n\n"
                 "Return ONLY valid JSON: {\"action\": \"open_terminal|browse|build|chat\", "
                 "\"target\": \"description of what to do\"}\n"
                 "open_terminal = user wants to open terminal or launch Claude Code\n"
-                "browse = user wants to search the web, look something up, visit a URL\n"
+                "browse = user wants to search or look something up, ideally via voice/research tools\n"
                 "build = user wants to create/build a software project\n"
                 "chat = just conversation, questions, or anything else\n"
                 "If unclear, default to \"chat\"."
@@ -584,8 +686,7 @@ async def classify_intent(text: str, client: anthropic.AsyncAnthropic) -> dict:
             "target": data.get("target", text),
         }
     except Exception as e:
-        log.warning(f"Intent classification failed: {e}")
-        return {"action": "chat", "target": text}
+        log.warning("Intent classification failed: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -650,7 +751,7 @@ def extract_action(response: str) -> tuple[str, dict | None]:
     Returns (clean_text_for_tts, action_dict_or_none).
     """
     match = _action_re.search(
-        r'\[ACTION:(BUILD|BROWSE|RESEARCH|OPEN_TERMINAL|PROMPT_PROJECT|ADD_TASK|ADD_NOTE|COMPLETE_TASK|REMEMBER|CREATE_NOTE|READ_NOTE|SCREEN|RUN_PYTHON)\]\s*(.*?)$',
+        r'\[ACTION:(BUILD|BROWSE|RESEARCH|OPEN_TERMINAL|OPEN_OVERLAY|PROMPT_PROJECT|ADD_TASK|ADD_NOTE|COMPLETE_TASK|REMEMBER|CREATE_NOTE|READ_NOTE|SCREEN|RUN_PYTHON)\]\s*(.*?)$',
         response, _action_re.DOTALL,
     )
     if match:
@@ -666,7 +767,7 @@ async def _execute_build(target: str):
     try:
         await handle_build(target)
     except Exception as e:
-        log.error(f"Build execution failed: {e}")
+        log.error("Build execution failed: %s", e)
 
 
 async def _execute_browse(target: str):
@@ -678,7 +779,7 @@ async def _execute_browse(target: str):
             from urllib.parse import quote
             await open_browser(f"https://www.google.com/search?q={quote(target)}")
     except Exception as e:
-        log.error(f"Browse execution failed: {e}")
+        log.error("Browse execution failed: %s", e)
 
 
 async def _execute_research(target: str, ws=None):
@@ -696,7 +797,7 @@ async def _execute_research(target: str, ws=None):
             f"The working directory is: {path}"
         )
 
-        log.info(f"Research started via claude -p in {path}")
+        log.info("Research started via claude -p in %s", path)
 
         process = await asyncio.create_subprocess_exec(
             "claude", "-p", "--output-format", "text", "--dangerously-skip-permissions",
@@ -712,7 +813,7 @@ async def _execute_research(target: str, ws=None):
         )
 
         result = stdout.decode().strip()
-        log.info(f"Research complete ({len(result)} chars)")
+        log.info("Research complete (%d chars)", len(result))
 
         recently_built.append({"name": name, "path": path, "time": time.time()})
 
@@ -726,20 +827,20 @@ async def _execute_research(target: str, ws=None):
 
         if report.exists():
             await open_browser(f"file://{report}")
-            log.info(f"Opened {report.name} in browser")
+            log.info("Opened %s in browser", report.name)
 
         # Notify via voice if WebSocket still connected
         if ws:
             try:
-                notify_text = f"Research is complete, sir. Report is open in your browser."
+                notify_text = "Research is complete, sir. Report is open in your browser."
                 audio = await synthesize_speech(notify_text)
                 if audio:
                     await ws.send_json({"type": "status", "state": "speaking"})
                     await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": notify_text})
                     await ws.send_json({"type": "status", "state": "idle"})
-                    log.info(f"JARVIS: {notify_text}")
-            except Exception:
-                pass  # WebSocket might be gone
+                    log.info("JARVIS: %s", notify_text)
+            except Exception as e:
+                log.debug("WebSocket notification failed: %s", e)  # WebSocket might be gone
 
     except asyncio.TimeoutError:
         log.error("Research timed out after 5 minutes")
@@ -748,10 +849,10 @@ async def _execute_research(target: str, ws=None):
                 audio = await synthesize_speech("Research timed out, sir. It was taking too long.")
                 if audio:
                     await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": "Research timed out, sir."})
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("WebSocket timeout notification failed: %s", e)
     except Exception as e:
-        log.error(f"Research execution failed: {e}")
+        log.error("Research execution failed: %s", e)
 
 
 async def _focus_terminal_window(project_name: str):
@@ -775,8 +876,8 @@ end tell
             stderr=asyncio.subprocess.PIPE,
         )
         await asyncio.wait_for(proc.communicate(), timeout=5)
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("Focus terminal failed: %s", e)
 
 
 async def _execute_open_terminal():
@@ -784,7 +885,7 @@ async def _execute_open_terminal():
     try:
         await handle_open_terminal()
     except Exception as e:
-        log.error(f"Open terminal failed: {e}")
+        log.error("Open terminal failed: %s", e)
 
 
 def _find_project_dir(project_name: str) -> str | None:
@@ -819,8 +920,8 @@ async def _execute_prompt_project(project_name: str, prompt: str, work_session: 
                 try:
                     await ws.send_json({"type": "status", "state": "speaking"})
                     await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("WS audio send failed: %s", e)
             return
 
         # Use a SEPARATE session so we don't trap the main conversation
@@ -828,9 +929,9 @@ async def _execute_prompt_project(project_name: str, prompt: str, work_session: 
         await dispatch.start(project_dir, project_name)
 
         # Bring matching Terminal window to front so user can watch
-        asyncio.create_task(_focus_terminal_window(project_name))
+        _create_task(_focus_terminal_window(project_name))
 
-        log.info(f"Dispatching to {project_name} in {project_dir}: {prompt[:80]}")
+        log.info("Dispatching to %s in %s: %s", project_name, project_dir, prompt[:80])
         dispatch_registry.update_status(dispatch_id, "building")
 
         # Run claude -p in background
@@ -845,8 +946,8 @@ async def _execute_prompt_project(project_name: str, prompt: str, work_session: 
             running_match = _re.search(r'https?://localhost:\d+', full_response or "")
         if running_match:
             url = running_match.group(1) if running_match.lastindex else running_match.group(0)
-            asyncio.create_task(_execute_browse(url))
-            log.info(f"Auto-opening {url}")
+            _create_task(_execute_browse(url))
+            log.info("Auto-opening %s", url)
             # Store URL in dispatch
             if dispatch_id:
                 dispatch_registry.update_status(dispatch_id, "completed",
@@ -875,15 +976,16 @@ async def _execute_prompt_project(project_name: str, prompt: str, work_session: 
                         messages=[{"role": "user", "content": f"Project: {project_name}\nClaude Code reported:\n{full_response[:3000]}"}],
                     )
                     msg = summary.content[0].text
-                except Exception:
+                except Exception as e:
+                    log.debug("Dispatch summary generation failed: %s", e)
                     msg = f"Sir, {project_name} finished. Here's the gist: {full_response[:200]}"
             else:
                 msg = f"Sir, {project_name} is done. {full_response[:200]}"
 
         # Speak the result — skip if user has spoken recently to avoid audio collision
-        log.info(f"Dispatch summary for {project_name}: {msg[:100]}")
+        log.info("Dispatch summary for %s: %s", project_name, msg[:100])
         if voice_state and time.time() - voice_state["last_user_time"] < 3:
-            log.info(f"Skipping dispatch audio for {project_name} — user spoke recently")
+            log.info("Skipping dispatch audio for %s — user spoke recently", project_name)
             # Result is still stored in history below so JARVIS can reference it
         else:
             audio = await synthesize_speech(strip_markdown_for_tts(msg))
@@ -892,37 +994,37 @@ async def _execute_prompt_project(project_name: str, prompt: str, work_session: 
                     await ws.send_json({"type": "status", "state": "speaking"})
                     if audio:
                         await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
-                        log.info(f"Dispatch audio sent for {project_name}")
+                        log.info("Dispatch audio sent for %s", project_name)
                     else:
                         await ws.send_json({"type": "text", "text": msg})
-                        log.info(f"Dispatch text fallback sent for {project_name}")
+                        log.info("Dispatch text fallback sent for %s", project_name)
                 except Exception as e:
-                    log.error(f"Dispatch audio send failed: {e}")
+                    log.error("Dispatch audio send failed: %s", e)
 
         # Store dispatch result in conversation history so JARVIS remembers it
         if history is not None:
             history.append({"role": "assistant", "content": f"[Dispatch result for {project_name}]: {msg}"})
 
         dispatch_registry.update_status(dispatch_id, "completed", response=full_response[:2000], summary=msg[:200])
-        log.info(f"Project {project_name} dispatch complete ({len(full_response)} chars)")
+        log.info("Project %s dispatch complete (%d chars)", project_name, len(full_response))
 
     except Exception as e:
-        log.error(f"Prompt project failed: {e}", exc_info=True)
+        log.error("Prompt project failed: %s", e, exc_info=True)
         try:
             msg = f"Had trouble connecting to {project_name}, sir."
             audio = await synthesize_speech(msg)
             if audio and ws:
                 await ws.send_json({"type": "status", "state": "speaking"})
                 await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("WS reconnect notification failed: %s", e)
 
 
 async def self_work_and_notify(session: WorkSession, prompt: str, ws):
     """Run claude -p in background and notify via voice when done."""
     try:
         full_response = await session.send(prompt)
-        log.info(f"Background work complete ({len(full_response)} chars)")
+        log.info("Background work complete (%d chars)", len(full_response))
 
         # Summarize and speak
         if anthropic_client and full_response:
@@ -934,7 +1036,8 @@ async def self_work_and_notify(session: WorkSession, prompt: str, ws):
                     messages=[{"role": "user", "content": f"Claude Code completed:\n{full_response[:2000]}"}],
                 )
                 msg = summary.content[0].text
-            except Exception:
+            except Exception as e:
+                log.debug("Background work summary generation failed: %s", e)
                 msg = "Work is complete, sir."
 
             try:
@@ -943,11 +1046,11 @@ async def self_work_and_notify(session: WorkSession, prompt: str, ws):
                     await ws.send_json({"type": "status", "state": "speaking"})
                     await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
                     await ws.send_json({"type": "status", "state": "idle"})
-                    log.info(f"JARVIS: {msg}")
-            except Exception:
-                pass
+                    log.info("JARVIS: %s", msg)
+            except Exception as e:
+                log.debug("Background work audio send failed: %s", e)
     except Exception as e:
-        log.error(f"Background work failed: {e}")
+        log.error("Background work failed: %s", e)
 
 
 # Smart greeting — track last greeting to avoid re-greeting on reconnect
@@ -988,10 +1091,10 @@ async def synthesize_speech(text: str) -> Optional[bytes]:
                 _append_usage_entry(0, 0, "tts")
                 return response.content
             else:
-                log.error(f"TTS error: {response.status_code}")
+                log.error("TTS error: %s", response.status_code)
                 return None
     except Exception as e:
-        log.error(f"TTS error: {e}")
+        log.error("TTS error: %s", e)
         return None
 
 
@@ -1068,7 +1171,7 @@ async def generate_response(
         track_usage(response)
         return response.content[0].text
     except Exception as e:
-        log.error(f"LLM error: {e}")
+        log.error("LLM error: %s", e)
         return "Apologies, sir. I'm having trouble connecting to my language systems."
 
 
@@ -1114,6 +1217,8 @@ class GroqWrapper:
 cached_projects: list[dict] = []
 recently_built: list[dict] = []  # [{"name": str, "path": str, "time": float}]
 dispatch_registry = DispatchRegistry()
+qa_agent = QAAgent()
+success_tracker = SuccessTracker()
 
 # Usage tracking — logs every call with timestamp, persists to disk
 _USAGE_FILE = Path(__file__).parent / "data" / "usage_log.jsonl"
@@ -1133,10 +1238,10 @@ def _append_usage_entry(input_tokens: int, output_tokens: int, call_type: str = 
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
         }
-        with open(_USAGE_FILE, "a") as f:
+        with open(_USAGE_FILE, "a", encoding="utf-8") as f:
             f.write(_json.dumps(entry) + "\n")
-    except Exception:
-        pass
+    except OSError as e:
+        log.debug("Usage write failed: %s", e)
 
 
 def _get_usage_for_period(seconds: float | None = None) -> dict:
@@ -1157,8 +1262,8 @@ def _get_usage_for_period(seconds: float | None = None) -> dict:
                         totals["tts_calls"] += 1
                     else:
                         totals["api_calls"] += 1
-    except Exception:
-        pass
+    except (OSError, ValueError) as e:
+        log.debug("Usage read failed: %s", e)
     return totals
 
 
@@ -1280,11 +1385,11 @@ return windowList
                                     })
                             if windows:
                                 _ctx_cache["screen"] = format_windows_for_context(windows)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("Window context failed: %s", e)
 
             except Exception as e:
-                log.debug(f"Context thread error: {e}")
+                log.debug("Context thread error: %s", e)
 
             # Weather — refresh every loop (30s is fine, API is fast)
             try:
@@ -1294,8 +1399,8 @@ return windowList
                     d = _json.loads(resp.read()).get("current", {})
                     temp = d.get("temperature_2m", "?")
                     _ctx_cache["weather"] = f"Current weather in St. Petersburg, FL: {temp}°F"
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("Weather refresh failed: %s", e)
 
             time.sleep(30)
 
@@ -1418,8 +1523,8 @@ def _scan_projects_sync() -> list[dict]:
         for entry in desktop.iterdir():
             if entry.is_dir() and not entry.name.startswith("."):
                 projects.append({"name": entry.name, "path": str(entry), "branch": ""})
-    except Exception:
-        pass
+    except OSError as e:
+        log.warning("Project scan failed: %s", e)
     return projects
 
 
@@ -1457,6 +1562,10 @@ def detect_action_fast(text: str) -> dict | None:
     if any(w in t for w in ["abre vs code", "abre visual studio", "abre código", "abre code"]):
         return {"action": "open_code"}
 
+    # Ask JARVIS to show himself
+    if any(p in t for p in ["jarvis estás ahí", "jarvis estas ahi", "jarvis esta ahi", "jarvis está ahí", "estás ahí", "estas ahi"]):
+        return {"action": "open_overlay"}
+
     # Show recent build
     if any(w in t for w in ["muéstrame lo que construiste", "abre lo que hiciste", "ver proyecto"]):
         return {"action": "show_recent"}
@@ -1491,6 +1600,11 @@ async def handle_open_terminal() -> str:
     return result["confirmation"]
 
 
+async def handle_open_overlay() -> str:
+    result = await open_overlay()
+    return result.get("confirmation", "I had trouble showing the overlay, sir.")
+
+
 async def handle_build(target: str) -> str:
     name = _generate_project_name(target)
     path = str(Path.home() / "Desktop" / name)
@@ -1498,12 +1612,12 @@ async def handle_build(target: str) -> str:
 
     # Write CLAUDE.md with clear instructions
     claude_md = Path(path) / "CLAUDE.md"
-    claude_md.write_text(f"# Task\n\n{target}\n\nBuild this completely. If web app, make index.html work standalone.\n")
+    claude_md.write_text(f"# Task\n\n{target}\n\nBuild this completely. If web app, make index.html work standalone.\n", encoding="utf-8")
 
     # Write prompt to a file, then pipe it to claude -p
     # This avoids all shell escaping issues
     prompt_file = Path(path) / ".jarvis_prompt.txt"
-    prompt_file.write_text(target)
+    prompt_file.write_text(target, encoding="utf-8")
 
     script = (
         'tell application "Terminal"\n'
@@ -1578,7 +1692,7 @@ async def _lookup_and_report(lookup_type: str, lookup_fn, ws, history: list[dict
 
         # Speak the result — skip audio if user spoke recently to avoid collision
         if voice_state and time.time() - voice_state["last_user_time"] < 3:
-            log.info(f"Skipping lookup audio for {lookup_type} — user spoke recently")
+            log.info("Skipping lookup audio for %s — user spoke recently", lookup_type)
             # Result is still stored in history below
         else:
             tts = strip_markdown_for_tts(result_text)
@@ -1590,14 +1704,8 @@ async def _lookup_and_report(lookup_type: str, lookup_fn, ws, history: list[dict
                 else:
                     await ws.send_json({"type": "text", "text": result_text})
                 await ws.send_json({"type": "status", "state": "idle"})
-            except Exception:
-                pass
-
-        log.info(f"Lookup {lookup_type} complete: {result_text[:80]}")
-
-        # Store lookup result in conversation history so JARVIS remembers it
-        if history is not None:
-            history.append({"role": "assistant", "content": f"[{lookup_type} check]: {result_text}"})
+            except Exception as e:
+                log.debug("Lookup result send failed: %s", e)
 
     except asyncio.TimeoutError:
         _active_lookups[lookup_id]["status"] = "timeout"
@@ -1608,11 +1716,11 @@ async def _lookup_and_report(lookup_type: str, lookup_fn, ws, history: list[dict
             if audio:
                 await ws.send_json({"type": "audio", "data": audio, "text": fallback})
             await ws.send_json({"type": "status", "state": "idle"})
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("Lookup timeout notification failed: %s", e)
     except Exception as e:
         _active_lookups[lookup_id]["status"] = "error"
-        log.warning(f"Lookup {lookup_type} failed: {e}")
+        log.warning("Lookup %s failed: %s", lookup_type, e)
     finally:
         # Clean up after 60s
         await asyncio.sleep(60)
@@ -1772,7 +1880,7 @@ blockquote {{ border-left: 3px solid #0ea5e9; margin-left: 0; padding-left: 16px
 </body></html>"""
 
         results_file = Path.home() / "Desktop" / ".jarvis_research.html"
-        results_file.write_text(html_content)
+        results_file.write_text(html_content, encoding="utf-8")
 
         browser_name = "firefox" if "firefox" in text.lower() else "chrome"
         await open_browser(f"file://{results_file}", browser_name)
@@ -1787,7 +1895,7 @@ blockquote {{ border-left: 3px solid #0ea5e9; margin-left: 0; padding-left: 16px
         return summary.content[0].text + " Full results are in your browser, sir."
 
     except Exception as e:
-        log.error(f"Research failed: {e}")
+        log.error("Research failed: %s", e)
         from urllib.parse import quote
         await open_browser(f"https://www.google.com/search?q={quote(target)}")
         return "Pulled up a search for that, sir."
@@ -1818,7 +1926,7 @@ Write an updated summary in 2-4 sentences capturing the key topics, decisions, a
         )
         return response.content[0].text.strip()
     except Exception as e:
-        log.warning(f"Summary update failed: {e}")
+        log.warning("Summary update failed: %s", e)
         return old_summary  # Keep old summary on failure
 
 
@@ -1892,15 +2000,16 @@ async def voice_handler(ws: WebSocket):
                     else:
                         await ws.send_json({"type": "text", "text": greeting})
                     history.append({"role": "assistant", "content": greeting})
-                    log.info(f"JARVIS: {greeting}")
+                    log.info("JARVIS: %s", greeting)
                 except Exception as e:
-                    log.warning(f"Greeting failed: {e}")
+                    log.warning("Greeting failed: %s", e)
 
-            asyncio.create_task(_send_greeting())
+            _create_task(_send_greeting())
 
         try:
             await ws.send_json({"type": "status", "state": "idle"})
-        except Exception:
+        except Exception as e:
+            log.debug("WebSocket idle notify failed: %s", e)
             return  # WebSocket already gone
 
         while True:
@@ -1939,7 +2048,7 @@ async def voice_handler(ws: WebSocket):
             _cancel_response = False
 
             voice_state["last_user_time"] = time.time()
-            log.info(f"User: {user_text}")
+            log.info("User: %s", user_text)
             await ws.send_json({"type": "status", "state": "thinking"})
 
             # Lazy project scan on first message
@@ -1952,8 +2061,9 @@ async def voice_handler(ws: WebSocket):
                         loop.run_in_executor(None, _scan_projects_sync),
                         timeout=3
                     )
-                    log.info(f"Scanned {len(cached_projects)} projects")
-                except Exception:
+                    log.info("Scanned %d projects", len(cached_projects))
+                except Exception as e:
+                    log.debug("Project scan failed: %s", e)
                     cached_projects = []
 
             try:
@@ -1974,9 +2084,9 @@ async def voice_handler(ws: WebSocket):
                         name = _generate_project_name(prompt)
                         path = str(Path.home() / "Desktop" / name)
                         os.makedirs(path, exist_ok=True)
-                        Path(path, "CLAUDE.md").write_text(prompt)
+                        Path(path, "CLAUDE.md").write_text(prompt, encoding="utf-8")
                         did = dispatch_registry.register(name, path, prompt[:200])
-                        asyncio.create_task(_execute_prompt_project(name, prompt, work_session, ws, dispatch_id=did, history=history, voice_state=voice_state))
+                        _create_task(_execute_prompt_project(name, prompt, work_session, ws, dispatch_id=did, history=history, voice_state=voice_state))
                         planner.reset()
                         response_text = "Building it now, sir."
                     elif planner.active_plan and planner.active_plan.confirmed is False and planner.active_plan.current_question_index >= len(planner.active_plan.pending_questions):
@@ -1987,9 +2097,9 @@ async def voice_handler(ws: WebSocket):
                             name = _generate_project_name(prompt)
                             path = str(Path.home() / "Desktop" / name)
                             os.makedirs(path, exist_ok=True)
-                            Path(path, "CLAUDE.md").write_text(prompt)
+                            Path(path, "CLAUDE.md").write_text(prompt, encoding="utf-8")
                             did = dispatch_registry.register(name, path, prompt[:200])
-                            asyncio.create_task(_execute_prompt_project(name, prompt, work_session, ws, dispatch_id=did, history=history, voice_state=voice_state))
+                            _create_task(_execute_prompt_project(name, prompt, work_session, ws, dispatch_id=did, history=history, voice_state=voice_state))
                             planner.reset()
                             response_text = "On it, sir."
                         elif result["cancelled"]:
@@ -2024,7 +2134,7 @@ async def voice_handler(ws: WebSocket):
                     else:
                         # Send to claude -p (full power)
                         await ws.send_json({"type": "status", "state": "working"})
-                        log.info(f"Work mode → claude -p: {user_text[:80]}")
+                        log.info("Work mode → claude -p: %s", user_text[:80])
 
                         full_response = await work_session.send(user_text)
 
@@ -2049,8 +2159,8 @@ async def voice_handler(ws: WebSocket):
                         import re as _re
                         localhost_match = _re.search(r'https?://localhost:\d+', full_response or "")
                         if localhost_match:
-                            asyncio.create_task(_execute_browse(localhost_match.group(0)))
-                            log.info(f"Auto-opening {localhost_match.group(0)}")
+                            _create_task(_execute_browse(localhost_match.group(0)))
+                            log.info("Auto-opening %s", localhost_match.group(0))
 
                         # Always summarize work mode responses via Haiku
                         if full_response and anthropic_client:
@@ -2069,7 +2179,8 @@ async def voice_handler(ws: WebSocket):
                                     messages=[{"role": "user", "content": f"Claude Code said:\n{full_response[:2000]}"}],
                                 )
                                 response_text = summary.content[0].text
-                            except Exception:
+                            except Exception as e:
+                                log.debug("Project summary generation failed: %s", e)
                                 response_text = full_response[:200]
                         else:
                             response_text = full_response
@@ -2102,33 +2213,37 @@ async def voice_handler(ws: WebSocket):
                                 else:
                                     cmd = opera_path
                                 
-                                log.info(f"Attempting to launch Opera GX: {cmd}")
-                                subprocess.Popen(cmd, shell=True, start_new_session=True)
+                                log.info("Attempting to launch Opera GX: %s", cmd)
+                                cmd_args = [opera_path] + ([target] if target else [])
+                                subprocess.Popen(cmd_args, start_new_session=True)
                             except Exception as e:
-                                log.error(f"Failed to launch Opera GX: {e}")
+                                log.error("Failed to launch Opera GX: %s", e)
                                 # Fallback to Chrome
                                 try:
                                     from browser import open_browser
-                                    asyncio.create_task(open_browser(target or "https://google.com"))
-                                except Exception:
-                                    pass
+                                    _create_task(open_browser(target or "https://google.com"))
+                                except Exception as e:
+                                    log.warning("Browser fallback failed: %s", e)
                         elif action["action"] == "open_code":
                             response_text = "Abriendo Visual Studio Code, señor."
                             try:
                                 import subprocess
-                                subprocess.Popen("code .", shell=True, start_new_session=True)
+                                subprocess.Popen(["code", "."], start_new_session=True)
                                 log.info("VS Code launched via Popen")
                             except Exception as e:
-                                log.error(f"Failed to launch VS Code: {e}")
+                                log.error("Failed to launch VS Code: %s", e)
+                        elif action["action"] == "open_overlay":
+                            response_text = "Para usted, señor."
+                            await handle_open_overlay()
                         elif action["action"] == "describe_screen":
                             response_text = "Echando un vistazo ahora mismo, señor."
-                            asyncio.create_task(_lookup_and_report("screen", _do_screen_lookup, ws, history=history, voice_state=voice_state))
+                            _create_task(_lookup_and_report("screen", _do_screen_lookup, ws, history=history, voice_state=voice_state))
                         elif action["action"] == "check_calendar":
                             response_text = "Revisando su calendario, señor."
-                            asyncio.create_task(_lookup_and_report("calendar", _do_calendar_lookup, ws, history=history, voice_state=voice_state))
+                            _create_task(_lookup_and_report("calendar", _do_calendar_lookup, ws, history=history, voice_state=voice_state))
                         elif action["action"] == "check_mail":
                             response_text = "Revisando su bandeja de entrada, señor."
-                            asyncio.create_task(_lookup_and_report("mail", _do_mail_lookup, ws, history=history, voice_state=voice_state))
+                            _create_task(_lookup_and_report("mail", _do_mail_lookup, ws, history=history, voice_state=voice_state))
                         elif action["action"] == "check_dispatch":
                             recent = dispatch_registry.get_most_recent()
                             if not recent:
@@ -2166,7 +2281,7 @@ async def voice_handler(ws: WebSocket):
                             # Check for action tags embedded in LLM response
                             clean_response, embedded_action = extract_action(response_text)
                             if embedded_action:
-                                log.info(f"LLM embedded action: {embedded_action}")
+                                log.info("LLM embedded action: %s", embedded_action)
                                 response_text = clean_response
                                 # Ensure there's always something to speak
                                 if not response_text.strip():
@@ -2201,31 +2316,32 @@ async def voice_handler(ws: WebSocket):
                                         "- If you reference a real product's UI (e.g. 'Zillow clone'), match their actual layout and features closely.\n"
                                         "- Use realistic mock data, not placeholder Lorem Ipsum.\n"
                                         "- After building, start the dev server and verify the app loads without errors.\n"
-                                        "- IMPORTANT: Your LAST line of output MUST be exactly: RUNNING_AT=http://localhost:PORT (the actual port the dev server is using)\n"
+                                        "- IMPORTANT: Your LAST line of output MUST be exactly: RUNNING_AT=http://localhost:PORT (the actual port the dev server is using)\n",
+                                        encoding="utf-8"
                                     )
 
                                     # Register and dispatch
                                     did = dispatch_registry.register(name, path, target)
-                                    asyncio.create_task(
+                                    _create_task(
                                         _execute_prompt_project(name, target, work_session, ws, dispatch_id=did, history=history, voice_state=voice_state)
                                     )
                                 elif embedded_action["action"] == "browse":
-                                    asyncio.create_task(_execute_browse(embedded_action["target"]))
+                                    _create_task(_execute_browse(embedded_action["target"]))
                                 elif embedded_action["action"] == "research":
                                     # Research enters work mode too
                                     name = _generate_project_name(embedded_action["target"])
                                     path = str(Path.home() / "Desktop" / name)
                                     os.makedirs(path, exist_ok=True)
                                     await work_session.start(path)
-                                    asyncio.create_task(
+                                    _create_task(
                                         self_work_and_notify(work_session, embedded_action["target"], ws)
                                     )
                                 elif embedded_action["action"] == "open_terminal":
-                                    asyncio.create_task(_execute_open_terminal())
+                                    _create_task(_execute_open_terminal())
                                 elif embedded_action["action"] == "run_python":
                                     code = embedded_action["target"]
                                     import python_sandbox
-                                    log.info(f"Running Python code: {code}")
+                                    log.info("Running Python code: %s", code)
                                     result = await asyncio.to_thread(python_sandbox.run_python_code, code)
                                     
                                     # Inject result and re-generate the final answer
@@ -2249,15 +2365,15 @@ async def voice_handler(ws: WebSocket):
                                         # Check for recent completed dispatch before re-dispatching
                                         recent = dispatch_registry.get_recent_for_project(proj_name)
                                         if recent and recent.get("summary"):
-                                            log.info(f"Using recent dispatch result for {proj_name} instead of re-dispatching")
+                                            log.info("Using recent dispatch result for %s instead of re-dispatching", proj_name)
                                             response_text = recent["summary"]
                                             history.append({"role": "assistant", "content": f"[Previous dispatch result for {proj_name}]: {recent['summary']}"})
                                         else:
-                                            asyncio.create_task(
+                                            _create_task(
                                                 _execute_prompt_project(proj_name, prompt, work_session, ws, history=history, voice_state=voice_state)
                                             )
                                     else:
-                                        log.warning(f"PROMPT_PROJECT missing ||| delimiter: {target}")
+                                        log.warning("PROMPT_PROJECT missing ||| delimiter: %s", target)
                                 elif embedded_action["action"] == "add_task":
                                     target = embedded_action["target"]
                                     parts = target.split("|||")
@@ -2267,7 +2383,7 @@ async def voice_handler(ws: WebSocket):
                                         desc = parts[2].strip() if len(parts) > 2 else ""
                                         due = parts[3].strip() if len(parts) > 3 else ""
                                         create_task(title=title, description=desc, priority=priority, due_date=due)
-                                        log.info(f"Task created: {title}")
+                                        log.info("Task created: %s", title)
                                 elif embedded_action["action"] == "add_note":
                                     target = embedded_action["target"]
                                     if "|||" in target:
@@ -2275,27 +2391,27 @@ async def voice_handler(ws: WebSocket):
                                         create_note(content=content.strip(), topic=topic.strip())
                                     else:
                                         create_note(content=target)
-                                    log.info(f"Note created")
+                                    log.info("Note created")
                                 elif embedded_action["action"] == "complete_task":
                                     try:
                                         task_id = int(embedded_action["target"].strip())
                                         complete_task(task_id)
-                                        log.info(f"Task {task_id} completed")
+                                        log.info("Task %s completed", task_id)
                                     except ValueError:
                                         pass
                                 elif embedded_action["action"] == "remember":
                                     remember(embedded_action["target"].strip(), mem_type="fact", importance=7)
-                                    log.info(f"Memory stored: {embedded_action['target'][:60]}")
+                                    log.info("Memory stored: %s", embedded_action["target"][:60])
                                 elif embedded_action["action"] == "create_note":
                                     target = embedded_action["target"]
                                     if "|||" in target:
                                         title, _, body = target.partition("|||")
-                                        asyncio.create_task(create_local_note(title.strip(), body.strip()))
-                                        log.info(f"Local Note created: {title.strip()}")
+                                        _create_task(create_local_note(title.strip(), body.strip()))
+                                        log.info("Local Note created: %s", title.strip())
                                     else:
-                                        asyncio.create_task(create_local_note("JARVIS Note", target))
+                                        _create_task(create_local_note("JARVIS Note", target))
                                 elif embedded_action["action"] == "screen":
-                                    asyncio.create_task(_lookup_and_report("screen", _do_screen_lookup, ws, history=history, voice_state=voice_state))
+                                    _create_task(_lookup_and_report("screen", _do_screen_lookup, ws, history=history, voice_state=voice_state))
                                 elif embedded_action["action"] == "read_note":
                                     # Read note in background and report back
                                     async def _read_and_report(search_term, _ws):
@@ -2309,9 +2425,9 @@ async def voice_handler(ws: WebSocket):
                                             try:
                                                 await _ws.send_json({"type": "status", "state": "speaking"})
                                                 await _ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
-                                            except Exception:
-                                                pass
-                                    asyncio.create_task(_read_and_report(embedded_action["target"].strip(), ws))
+                                            except Exception as e:
+                                                log.debug("Embedded action audio send failed: %s", e)
+                                    _create_task(_read_and_report(embedded_action["target"].strip(), ws))
 
                 # Update history
                 history.append({"role": "user", "content": user_text})
@@ -2335,13 +2451,13 @@ async def voice_handler(ws: WebSocket):
                                 session_summary, rotated, anthropic_client
                             )
                             summary_update_pending = False
-                        asyncio.create_task(_do_summary())
+                        _create_task(_do_summary())
                     else:
                         summary_update_pending = False
 
                 # Extract memories in background (doesn't block response)
                 if anthropic_client and len(user_text) > 15:
-                    asyncio.create_task(extract_memories(user_text, response_text, anthropic_client))
+                    _create_task(extract_memories(user_text, response_text, anthropic_client))
 
                 # TTS - Optimized: send text immediately, then audio
                 tts = strip_markdown_for_tts(response_text)
@@ -2354,11 +2470,11 @@ async def voice_handler(ws: WebSocket):
                 else:
                     # Status already sent, just ensure idle if audio fails
                     await ws.send_json({"type": "status", "state": "idle"})
-                log.info(f"JARVIS: {response_text}")
+                log.info("JARVIS: %s", response_text)
                 last_jarvis_response = response_text
 
             except Exception as e:
-                log.error(f"Error: {e}", exc_info=True)
+                log.error("Error: %s", e, exc_info=True)
                 try:
                     fallback = "Something went wrong, sir."
                     audio = await synthesize_speech(fallback)
@@ -2367,13 +2483,13 @@ async def voice_handler(ws: WebSocket):
                     else:
                         await ws.send_json({"type": "text", "text": fallback})
                     # Let client's audioPlayer.onFinished handle idle transition
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("Fallback send failed: %s", e)
 
     except WebSocketDisconnect:
         log.info("Voice WebSocket disconnected")
     except Exception as e:
-        log.error(f"WebSocket error: {e}", exc_info=True)
+        log.error("WebSocket error: %s", e, exc_info=True)
     finally:
         task_manager.unregister_websocket(ws)
 
@@ -2397,7 +2513,7 @@ def _read_env() -> tuple[list[str], dict[str, str]]:
             import shutil as _shutil
             _shutil.copy2(str(example), str(path))
         else:
-            path.write_text("")
+            path.write_text("", encoding="utf-8")
     lines = path.read_text().splitlines()
     parsed: dict[str, str] = {}
     for line in lines:
@@ -2423,7 +2539,7 @@ def _write_env_key(key: str, value: str) -> None:
         new_lines.append(line)
     if not found:
         new_lines.append(f"{key}={value}")
-    _env_file_path().write_text("\n".join(new_lines) + "\n")
+    _env_file_path().write_text("\n".join(new_lines) + "\n", encoding="utf-8")
     os.environ[key] = value
 
 class KeyUpdate(BaseModel):
@@ -2485,17 +2601,30 @@ async def api_settings_status():
     _, env_dict = _read_env()
     claude_installed = _shutil.which("claude") is not None
     calendar_ok = mail_ok = notes_ok = False
-    try: await get_todays_events(); calendar_ok = True
-    except Exception: pass
-    try: await get_unread_count(); mail_ok = True
-    except Exception: pass
-    try: await get_recent_notes(count=1); notes_ok = True
-    except Exception: pass
+    try:
+        await get_todays_events()
+        calendar_ok = True
+    except Exception as e:
+        log.debug("Calendar health check failed: %s", e)
+    try:
+        await get_unread_count()
+        mail_ok = True
+    except Exception as e:
+        log.debug("Mail health check failed: %s", e)
+    try:
+        await get_recent_notes(count=1)
+        notes_ok = True
+    except Exception as e:
+        log.debug("Notes health check failed: %s", e)
     memory_count = task_count = 0
-    try: memory_count = len(get_important_memories(limit=9999))
-    except Exception: pass
-    try: task_count = len(get_open_tasks())
-    except Exception: pass
+    try:
+        memory_count = len(get_important_memories(limit=9999))
+    except Exception as e:
+        log.debug("Memory count failed: %s", e)
+    try:
+        task_count = len(get_open_tasks())
+    except Exception as e:
+        log.debug("Task count failed: %s", e)
     return {
         "claude_code_installed": claude_installed,
         "calendar_accessible": calendar_ok,
@@ -2551,7 +2680,7 @@ prompt="El usuario está hablando. Comando para JARVIS.",
         )
         return {"text": response.text}
     except Exception as e:
-        log.error(f"Whisper transcription failed: {e}")
+        log.error("Whisper transcription failed: %s", e)
         return {"text": ""}
 
 @app.post("/api/restart")
@@ -2562,7 +2691,7 @@ async def api_restart():
         await asyncio.sleep(2)
         cmd = [sys.executable, __file__, "--port", "8340", "--host", "0.0.0.0"]
         os.execv(sys.executable, cmd)
-    asyncio.create_task(_restart())
+    _create_task(_restart())
     return {"status": "restarting"}
 
 

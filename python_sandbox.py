@@ -3,7 +3,10 @@ import tempfile
 import subprocess
 import logging
 
+import action_gate
+
 log = logging.getLogger("jarvis.sandbox")
+
 
 def run_python_code(code: str) -> str:
     """
@@ -11,19 +14,25 @@ def run_python_code(code: str) -> str:
     Used by JARVIS to perform complex math, data analysis, and logic verification.
     """
     try:
+        ok, reason = action_gate.validate_python_code(code)
+        if not ok:
+            return reason
+
         # Create a temporary file
         fd, path = tempfile.mkstemp(suffix=".py", text=True)
         with os.fdopen(fd, 'w') as f:
             f.write(code)
-            
+
         log.info(f"Executing Python Sandbox code in {path}")
-        
+
         # Run the script with a 10-second timeout
+        # Restrict environment to avoid inheriting secrets (API keys, etc.)
         result = subprocess.run(
             ["python3", path],
             capture_output=True,
             text=True,
-            timeout=10
+            timeout=10,
+            env={"PATH": "/usr/bin:/usr/local/bin"},
         )
         
         # Clean up

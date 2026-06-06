@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import re
+import sys
 import time
 import platform
 from pathlib import Path
@@ -170,6 +171,45 @@ async def open_browser(url: str, browser: str = "chrome") -> dict:
 
 async def open_chrome(url: str) -> dict:
     return await open_browser(url, "chrome")
+
+
+async def open_overlay() -> dict:
+    """Open the Linux JARVIS overlay window for the orb display."""
+    overlay_script = Path(__file__).parent / "desktop-overlay" / "linux_overlay.py"
+    if not overlay_script.exists():
+        return {
+            "success": False,
+            "confirmation": "Overlay script not found, sir.",
+        }
+
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable,
+        str(overlay_script),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    # Do not wait for the overlay app to exit.
+    # If the process fails immediately, capture the error for debugging.
+    await asyncio.sleep(0.1)
+    success = proc.returncode in (0, None)
+    if proc.returncode is None:
+        return {
+            "success": True,
+            "confirmation": "JARVIS overlay should appear shortly, sir.",
+        }
+    if not success:
+        stderr = (await proc.stderr.read()).decode('utf-8', errors='ignore') if proc.stderr else ""
+        log.error(f"open_overlay failed: {stderr}")
+        return {
+            "success": False,
+            "confirmation": "I could not launch the overlay, sir.",
+        }
+
+    return {
+        "success": True,
+        "confirmation": "JARVIS overlay should appear shortly, sir.",
+    }
 
 
 async def open_claude_in_project(project_dir: str, prompt: str) -> dict:
