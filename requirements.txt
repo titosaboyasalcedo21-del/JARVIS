@@ -1,3 +1,6 @@
+# ---------------------------------------------------------------------------
+# Core dependencies (required)
+# ---------------------------------------------------------------------------
 anthropic>=0.39.0
 groq>=0.5.0
 httpx>=0.27.0
@@ -8,8 +11,18 @@ pydantic>=2.0.0
 websockets>=13.0
 playwright>=1.40.0
 pyyaml>=6.0
+
+# Vector search (optional - SQLite FTS fallback available)
 chromadb>=0.4.24
+
+# Google Calendar/Mail integration (optional)
 google-api-python-client>=2.0.0
 google-auth-httplib2>=0.2.0
 google-auth-oauthlib>=1.2.0
+
+# Linux overlay (optional - requires Qt/GTK)
 pywebview>=4.0.0
+
+# Wake word detection (optional - requires Porcupine account)
+pvporcupine>=2.0.0
+pvrecorder>=1.0.0

@@ -93,11 +93,17 @@ def init_db():
 # Memories — facts JARVIS learns
 # ---------------------------------------------------------------------------
 
+_chroma_client = None
+
 def _get_chroma():
+    global _chroma_client
+    if _chroma_client is not None:
+        return _chroma_client
     try:
         import chromadb
         client = chromadb.PersistentClient(path=str(DB_PATH.parent / "chroma"))
-        return client.get_or_create_collection(name="jarvis_memories")
+        _chroma_client = client.get_or_create_collection(name="jarvis_memories")
+        return _chroma_client
     except Exception as e:
         log.warning(f"ChromaDB not ready yet: {e}. Falling back to SQLite FTS.")
         return None

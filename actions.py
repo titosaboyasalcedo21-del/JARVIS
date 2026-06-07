@@ -10,6 +10,16 @@ from urllib.parse import quote
 
 log = logging.getLogger("jarvis.actions")
 
+def _safe_shell(arg: str) -> str:
+    """Escape a shell argument using shlex.quote()."""
+    import shlex
+    return shlex.quote(arg)
+
+def _safe_applescript(value: str) -> str:
+    """Escape a value for AppleScript (quote escaping)."""
+    # AppleScript uses " for strings, escape any internal "
+    return value.replace('"', '\"')
+
 DESKTOP_PATH = Path.home() / "Desktop"
 IS_MAC = platform.system() == "Darwin"
 IS_LINUX = platform.system() == "Linux"
@@ -108,7 +118,7 @@ async def open_terminal(command: str = "") -> dict:
         if command:
             # We use gnome-terminal which is standard on Ubuntu
             # 'bash -c' allows running a command and then keeping the terminal open with 'exec bash'
-            full_cmd = f'gnome-terminal -- bash -c "{command}; exec bash"'
+            full_cmd = f'gnome-terminal -- bash -c {_safe_shell(command) + "; exec bash"}'
         else:
             full_cmd = 'gnome-terminal'
         
@@ -368,11 +378,12 @@ async def monitor_build(project_dir: str, ws=None, synthesize_fn=None) -> None:
                 if ws and synthesize_fn:
                     try:
                         msg = "The build is complete, sir."
-                        audio_bytes = await synthesize_fn(msg)
+                        audio_bytes, fmt = await synthesize_fn(msg)
                         if audio_bytes:
-                            encoded = base64.b64encode(audio_bytes).decode()
                             await ws.send_json({"type": "status", "state": "speaking"})
-                            await ws.send_json({"type": "audio", "data": encoded, "text": msg})
+                            audio_msg = _build_audio_message(audio_bytes, fmt, msg)
+                            if audio_msg:
+                                await ws.send_json(audio_msg)
                             await ws.send_json({"type": "status", "state": "idle"})
                     except:
                         pass

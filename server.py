@@ -689,9 +689,32 @@ async def classify_intent(text: str, client: anthropic.AsyncAnthropic) -> dict:
         log.warning("Intent classification failed: %s", e)
 
 
+        return {"action": "chat", "target": text}
 # ---------------------------------------------------------------------------
 # Markdown Stripping for TTS
 # ---------------------------------------------------------------------------
+
+
+def _escape_shell_arg(arg: str) -> str:
+    import shlex
+    return shlex.quote(arg)
+
+def _escape_applescript_path(path: str) -> str:
+    return _escape_shell_arg(str(Path(path).resolve()))
+
+def _build_audio_message(audio_bytes: bytes | None, audio_format: str, text: str) -> dict | None:
+    if not audio_bytes:
+        return None
+    mime_map = {"mp3": "audio/mp3", "wav": "audio/wav"}
+    return {
+        "type": "audio",
+        "data": base64.b64encode(audio_bytes).decode(),
+        "text": text,
+        "format": audio_format,
+        "mime": mime_map.get(audio_format, "application/octet-stream")
+    }
+
+_fish_tts_disabled: bool = False
 
 def strip_markdown_for_tts(text: str) -> str:
     """Strip ALL markdown from text before sending to TTS."""
@@ -833,10 +856,12 @@ async def _execute_research(target: str, ws=None):
         if ws:
             try:
                 notify_text = "Research is complete, sir. Report is open in your browser."
-                audio = await synthesize_speech(notify_text)
+                audio, fmt = await synthesize_speech(notify_text)
                 if audio:
                     await ws.send_json({"type": "status", "state": "speaking"})
-                    await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": notify_text})
+                    audio_msg = _build_audio_message(audio, fmt, notify_text)
+                    if audio_msg:
+                        await ws.send_json(audio_msg)
                     await ws.send_json({"type": "status", "state": "idle"})
                     log.info("JARVIS: %s", notify_text)
             except Exception as e:
@@ -846,9 +871,11 @@ async def _execute_research(target: str, ws=None):
         log.error("Research timed out after 5 minutes")
         if ws:
             try:
-                audio = await synthesize_speech("Research timed out, sir. It was taking too long.")
+                audio, fmt = await synthesize_speech("Research timed out, sir. It was taking too long.")
                 if audio:
-                    await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": "Research timed out, sir."})
+                    audio_msg = _build_audio_message(audio, fmt, "Research timed out, sir.")
+                    if audio_msg:
+                        await ws.send_json(audio_msg)
             except Exception as e:
                 log.debug("WebSocket timeout notification failed: %s", e)
     except Exception as e:
@@ -915,11 +942,13 @@ async def _execute_prompt_project(project_name: str, prompt: str, work_session: 
 
         if not project_dir:
             msg = f"Couldn't find the {project_name} project directory, sir."
-            audio = await synthesize_speech(msg)
+            audio, fmt = await synthesize_speech(msg)
             if audio and ws:
                 try:
                     await ws.send_json({"type": "status", "state": "speaking"})
-                    await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
+                    audio_msg = _build_audio_message(audio, fmt, msg)
+                    if audio_msg:
+                        await ws.send_json(audio_msg)
                 except Exception as e:
                     log.debug("WS audio send failed: %s", e)
             return
@@ -988,12 +1017,14 @@ async def _execute_prompt_project(project_name: str, prompt: str, work_session: 
             log.info("Skipping dispatch audio for %s — user spoke recently", project_name)
             # Result is still stored in history below so JARVIS can reference it
         else:
-            audio = await synthesize_speech(strip_markdown_for_tts(msg))
+            audio, fmt = await synthesize_speech(strip_markdown_for_tts(msg))
             if ws:
                 try:
                     await ws.send_json({"type": "status", "state": "speaking"})
                     if audio:
-                        await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
+                        audio_msg = _build_audio_message(audio, fmt, msg)
+                        if audio_msg:
+                            await ws.send_json(audio_msg)
                         log.info("Dispatch audio sent for %s", project_name)
                     else:
                         await ws.send_json({"type": "text", "text": msg})
@@ -1012,10 +1043,12 @@ async def _execute_prompt_project(project_name: str, prompt: str, work_session: 
         log.error("Prompt project failed: %s", e, exc_info=True)
         try:
             msg = f"Had trouble connecting to {project_name}, sir."
-            audio = await synthesize_speech(msg)
+            audio, fmt = await synthesize_speech(msg)
             if audio and ws:
                 await ws.send_json({"type": "status", "state": "speaking"})
-                await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
+                audio_msg = _build_audio_message(audio, fmt, msg)
+                if audio_msg:
+                    await ws.send_json(audio_msg)
         except Exception as e:
             log.debug("WS reconnect notification failed: %s", e)
 
@@ -1041,10 +1074,12 @@ async def self_work_and_notify(session: WorkSession, prompt: str, ws):
                 msg = "Work is complete, sir."
 
             try:
-                audio = await synthesize_speech(msg)
+                audio, fmt = await synthesize_speech(msg)
                 if audio:
                     await ws.send_json({"type": "status", "state": "speaking"})
-                    await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
+                    audio_msg = _build_audio_message(audio, fmt, msg)
+                    if audio_msg:
+                        await ws.send_json(audio_msg)
                     await ws.send_json({"type": "status", "state": "idle"})
                     log.info("JARVIS: %s", msg)
             except Exception as e:
@@ -1450,7 +1485,7 @@ async def health():
 @app.get("/api/tts-test")
 async def tts_test():
     """Generate a test audio clip for debugging."""
-    audio = await synthesize_speech("Testing audio, sir.")
+    audio, fmt = await synthesize_speech("Testing audio, sir.")
     if audio:
         return {"audio": base64.b64encode(audio).decode()}
     return {"audio": None, "error": "TTS failed"}
@@ -1696,11 +1731,13 @@ async def _lookup_and_report(lookup_type: str, lookup_fn, ws, history: list[dict
             # Result is still stored in history below
         else:
             tts = strip_markdown_for_tts(result_text)
-            audio = await synthesize_speech(tts)
+            audio, fmt = await synthesize_speech(tts)
             try:
                 await ws.send_json({"type": "status", "state": "speaking"})
                 if audio:
-                    await ws.send_json({"type": "audio", "data": audio, "text": result_text})
+                    audio_msg = _build_audio_message(audio, fmt, result_text)
+                    if audio_msg:
+                        await ws.send_json(audio_msg)
                 else:
                     await ws.send_json({"type": "text", "text": result_text})
                 await ws.send_json({"type": "status", "state": "idle"})
@@ -1711,10 +1748,12 @@ async def _lookup_and_report(lookup_type: str, lookup_fn, ws, history: list[dict
         _active_lookups[lookup_id]["status"] = "timeout"
         try:
             fallback = f"That {lookup_type} check is taking too long, sir. The data may still be syncing."
-            audio = await synthesize_speech(fallback)
+            audio, fmt = await synthesize_speech(fallback)
             await ws.send_json({"type": "status", "state": "speaking"})
             if audio:
-                await ws.send_json({"type": "audio", "data": audio, "text": fallback})
+                audio_msg = _build_audio_message(audio, fmt, fallback)
+                if audio_msg:
+                    await ws.send_json(audio_msg)
             await ws.send_json({"type": "status", "state": "idle"})
         except Exception as e:
             log.debug("Lookup timeout notification failed: %s", e)
@@ -1992,13 +2031,12 @@ async def voice_handler(ws: WebSocket):
 
             async def _send_greeting():
                 try:
-                    audio_bytes = await synthesize_speech(greeting)
+                    audio_bytes, fmt = await synthesize_speech(greeting)
                     if audio_bytes:
-                        encoded = base64.b64encode(audio_bytes).decode()
                         await ws.send_json({"type": "status", "state": "speaking"})
-                        await ws.send_json({"type": "audio", "data": encoded, "text": greeting})
-                    else:
-                        await ws.send_json({"type": "text", "text": greeting})
+                        audio_msg = _build_audio_message(audio_bytes, fmt, greeting)
+                        if audio_msg:
+                            await ws.send_json(audio_msg)
                     history.append({"role": "assistant", "content": greeting})
                     log.info("JARVIS: %s", greeting)
                 except Exception as e:
@@ -2026,13 +2064,20 @@ async def voice_handler(ws: WebSocket):
                 response_text = "Work mode active in my own repo, sir. Tell me what needs fixing."
                 tts = strip_markdown_for_tts(response_text)
                 await ws.send_json({"type": "status", "state": "speaking"})
-                audio = await synthesize_speech(tts)
+                audio, fmt = await synthesize_speech(tts)
                 if audio:
-                    await ws.send_json({"type": "audio", "data": audio, "text": response_text})
+                    audio_msg = _build_audio_message(audio, fmt, response_text)
+                    if audio_msg:
+                        await ws.send_json(audio_msg)
                 else:
                     await ws.send_json({"type": "text", "text": response_text})
                 continue
 
+            # Handle ping for connection health
+            if msg.get("type") == "ping":
+                await ws.send_json({"type": "pong"})
+                continue
+            
             if msg.get("type") != "transcript" or not msg.get("isFinal"):
                 continue
 
@@ -2420,11 +2465,13 @@ async def voice_handler(ws: WebSocket):
                                             msg = f"Sir, your note '{note['title']}' says: {note['body'][:200]}"
                                         else:
                                             msg = f"Couldn't find a note matching '{search_term}', sir."
-                                        audio = await synthesize_speech(strip_markdown_for_tts(msg))
+                                        audio, fmt = await synthesize_speech(strip_markdown_for_tts(msg))
                                         if audio and _ws:
                                             try:
                                                 await _ws.send_json({"type": "status", "state": "speaking"})
-                                                await _ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
+                                                audio_msg = _build_audio_message(audio, fmt, msg)
+                                                if audio_msg:
+                                                    await _ws.send_json(audio_msg)
                                             except Exception as e:
                                                 log.debug("Embedded action audio send failed: %s", e)
                                     _create_task(_read_and_report(embedded_action["target"].strip(), ws))
@@ -2464,9 +2511,11 @@ async def voice_handler(ws: WebSocket):
                 await ws.send_json({"type": "text", "text": response_text})
                 
                 await ws.send_json({"type": "status", "state": "speaking"})
-                audio = await synthesize_speech(tts)
+                audio, fmt = await synthesize_speech(tts)
                 if audio:
-                    await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": response_text})
+                    audio_msg = _build_audio_message(audio, fmt, response_text)
+                    if audio_msg:
+                        await ws.send_json(audio_msg)
                 else:
                     # Status already sent, just ensure idle if audio fails
                     await ws.send_json({"type": "status", "state": "idle"})
@@ -2477,9 +2526,11 @@ async def voice_handler(ws: WebSocket):
                 log.error("Error: %s", e, exc_info=True)
                 try:
                     fallback = "Something went wrong, sir."
-                    audio = await synthesize_speech(fallback)
+                    audio, fmt = await synthesize_speech(fallback)
                     if audio:
-                        await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": fallback})
+                        audio_msg = _build_audio_message(audio, fmt, fallback)
+                        if audio_msg:
+                            await ws.send_json(audio_msg)
                     else:
                         await ws.send_json({"type": "text", "text": fallback})
                     # Let client's audioPlayer.onFinished handle idle transition
