@@ -1093,19 +1093,13 @@ _last_greeting_time: float = 0
 
 
 # ---------------------------------------------------------------------------
-# TTS (Fish Audio)
+# TTS (Fish Audio + Offline Fallback)
 # ---------------------------------------------------------------------------
 
-async def synthesize_speech(text: str) -> Optional[bytes]:
-    """Generate speech audio from text using Fish Audio TTS."""
+async def synthesize_speech(text: str) -> tuple[bytes | None, str]:
     if not FISH_API_KEY:
         log.warning("FISH_API_KEY not set, skipping TTS")
-        return None
-
-    # Ensure the utterance matches the configured language.
-    # JARVIS's system prompt enforces Spanish, but the user may want other languages.
-    # If Fish Audio supports explicit language codes in future, this is where it should be added.
-
+        return None, ""
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as http:
@@ -1124,13 +1118,49 @@ async def synthesize_speech(text: str) -> Optional[bytes]:
             if response.status_code == 200:
                 _session_tokens["tts_calls"] += 1
                 _append_usage_entry(0, 0, "tts")
-                return response.content
-            else:
-                log.error("TTS error: %s", response.status_code)
-                return None
+                return response.content, "mp3"
+            if response.status_code in (401, 402, 403):
+                _fish_tts_disabled = True
+                log.warning("Fish TTS disabled (HTTP %s) for this session.", response.status_code)
     except Exception as e:
-        log.error("TTS error: %s", e)
-        return None
+        log.debug("Fish TTS error: %s", e)
+
+    try:
+        import tempfile
+        fd, path = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        try:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "espeak-ng", "-v", "en-us", "-s", "150", "-w", path, text,
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                )
+                await proc.communicate()
+                if proc.returncode == 0 and os.path.exists(path):
+                    with open(path, "rb") as f:
+                        return f.read(), "wav"
+            except FileNotFoundError:
+                pass
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "text2wave", "-o", path,
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                    stdin=asyncio.subprocess.PIPE
+                )
+                await proc.communicate(input=text.encode())
+                if proc.returncode == 0 and os.path.exists(path):
+                    with open(path, "rb") as f:
+                        return f.read(), "wav"
+            except FileNotFoundError:
+                pass
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+    except Exception as e:
+        log.debug("Offline TTS failed: %s", e)
+    return None, ""
 
 
 # ---------------------------------------------------------------------------
@@ -1487,7 +1517,7 @@ async def tts_test():
     """Generate a test audio clip for debugging."""
     audio, fmt = await synthesize_speech("Testing audio, sir.")
     if audio:
-        return {"audio": base64.b64encode(audio).decode()}
+        return {"audio": base64.b64encode(audio).decode(), "format": fmt}
     return {"audio": None, "error": "TTS failed"}
 
 
