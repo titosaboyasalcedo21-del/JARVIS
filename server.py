@@ -38,7 +38,8 @@ from typing import Optional, Any
 
 import anthropic
 import httpx
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Depends
+
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -863,6 +864,8 @@ async def _execute_research(target: str, ws=None):
                     if audio_msg:
                         await ws.send_json(audio_msg)
                     await ws.send_json({"type": "status", "state": "idle"})
+                else:
+                    await ws.send_json({"type": "text", "text": notify_text})
                     log.info("JARVIS: %s", notify_text)
             except Exception as e:
                 log.debug("WebSocket notification failed: %s", e)  # WebSocket might be gone
@@ -876,6 +879,8 @@ async def _execute_research(target: str, ws=None):
                     audio_msg = _build_audio_message(audio, fmt, "Research timed out, sir.")
                     if audio_msg:
                         await ws.send_json(audio_msg)
+                elif ws:
+                    await ws.send_json({"type": "text", "text": "Research timed out, sir. It was taking too long."})
             except Exception as e:
                 log.debug("WebSocket timeout notification failed: %s", e)
     except Exception as e:
@@ -951,6 +956,8 @@ async def _execute_prompt_project(project_name: str, prompt: str, work_session: 
                         await ws.send_json(audio_msg)
                 except Exception as e:
                     log.debug("WS audio send failed: %s", e)
+            elif ws:
+                await ws.send_json({"type": "text", "text": msg})
             return
 
         # Use a SEPARATE session so we don't trap the main conversation
@@ -1031,6 +1038,8 @@ async def _execute_prompt_project(project_name: str, prompt: str, work_session: 
                         log.info("Dispatch text fallback sent for %s", project_name)
                 except Exception as e:
                     log.error("Dispatch audio send failed: %s", e)
+                except Exception as e:
+                    log.error("Dispatch audio send failed: %s", e)
 
         # Store dispatch result in conversation history so JARVIS remembers it
         if history is not None:
@@ -1096,59 +1105,89 @@ _last_greeting_time: float = 0
 # TTS (Fish Audio + Offline Fallback)
 # ---------------------------------------------------------------------------
 
-async def synthesize_speech(text: str) -> tuple[bytes | None, str]:
-    if not FISH_API_KEY:
-        log.warning("FISH_API_KEY not set, skipping TTS")
-        return None, ""
+async def synthesize_speech(text: str) -> tuple[bytes, str]:
+    """Sintetiza texto a audio usando Fish Audio.
 
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as http:
-            response = await http.post(
-                FISH_API_URL,
-                headers={
-                    "Authorization": f"Bearer {FISH_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "text": text,
-                    "reference_id": FISH_VOICE_ID,
-                    "format": "mp3",
-                },
-            )
-            if response.status_code == 200:
-                _session_tokens["tts_calls"] += 1
-                _append_usage_entry(0, 0, "tts")
-                return response.content, "mp3"
-            if response.status_code in (401, 402, 403):
-                _fish_tts_disabled = True
-                log.warning("Fish TTS disabled (HTTP %s) for this session.", response.status_code)
-    except Exception as e:
-        log.debug("Fish TTS error: %s", e)
+    Siempre retorna (audio_bytes, format) — nunca None.
+    En caso de fallo retorna (b"", "mp3").
+    """
 
+    if not text or not text.strip():
+        return b"", "mp3"
+
+    # Si Fish está configurado, intentar primero
+    if FISH_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as http:
+                response = await http.post(
+                    FISH_API_URL,
+                    headers={
+                        "Authorization": f"Bearer {FISH_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "text": text,
+                        "reference_id": FISH_VOICE_ID,
+                        "format": "mp3",
+                        "mp3_bitrate": 128,
+                    },
+                )
+                if response.status_code == 200 and response.content:
+                    _session_tokens["tts_calls"] += 1
+                    _append_usage_entry(0, 0, "tts")
+                    return response.content, "mp3"
+
+                if response.status_code in (401, 402, 403):
+                    # No romper el sistema: simplemente caer al fallback offline
+                    log.warning(
+                        "Fish TTS disabled (HTTP %s) for this session.",
+                        response.status_code,
+                    )
+        except Exception as e:
+            log.debug("Fish TTS error: %s", e)
+
+    # Fallback offline: espeak-ng (preferible) o text2wave
     try:
         import tempfile
+
         fd, path = tempfile.mkstemp(suffix=".wav")
         os.close(fd)
         try:
+            # espeak-ng suele estar disponible en Linux
             try:
                 proc = await asyncio.create_subprocess_exec(
-                    "espeak-ng", "-v", "en-us", "-s", "150", "-w", path, text,
-                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                    "espeak-ng",
+                    "-v",
+                    "es",
+                    "-s",
+                    "140",
+                    "-p",
+                    "40",
+                    "-w",
+                    path,
+                    text,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
                 )
                 await proc.communicate()
-                if proc.returncode == 0 and os.path.exists(path):
+                if proc.returncode == 0 and os.path.exists(path) and os.path.getsize(path) > 0:
                     with open(path, "rb") as f:
                         return f.read(), "wav"
             except FileNotFoundError:
                 pass
+
+            # text2wave alternativo
             try:
                 proc = await asyncio.create_subprocess_exec(
-                    "text2wave", "-o", path,
-                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                    stdin=asyncio.subprocess.PIPE
+                    "text2wave",
+                    "-o",
+                    path,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    stdin=asyncio.subprocess.PIPE,
                 )
                 await proc.communicate(input=text.encode())
-                if proc.returncode == 0 and os.path.exists(path):
+                if proc.returncode == 0 and os.path.exists(path) and os.path.getsize(path) > 0:
                     with open(path, "rb") as f:
                         return f.read(), "wav"
             except FileNotFoundError:
@@ -1160,7 +1199,8 @@ async def synthesize_speech(text: str) -> tuple[bytes | None, str]:
                 pass
     except Exception as e:
         log.debug("Offline TTS failed: %s", e)
-    return None, ""
+
+    return b"", "mp3"
 
 
 # ---------------------------------------------------------------------------
@@ -1496,29 +1536,55 @@ async def lifespan(application: FastAPI):
 
 app = FastAPI(title="JARVIS Server", version="0.1.0", lifespan=lifespan)
 
+ALLOWED_ORIGINS = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["Content-Type", "Authorization"],
 )
+
 
 
 # -- REST Endpoints --------------------------------------------------------
 
+JARVIS_TOKEN = os.getenv("JARVIS_SECRET_TOKEN", "")
+
+
+def verify_token(token: str) -> bool:
+    """Dev-mode behavior: if token not configured, allow access."""
+    if not JARVIS_TOKEN:
+        return True
+    return token == JARVIS_TOKEN
+
+
+async def require_auth(x_jarvis_token: str = "") -> None:
+    from fastapi import Header, HTTPException
+
+    if not verify_token(x_jarvis_token):
+        raise HTTPException(status_code=401, detail="Token inválido")
+
+
 @app.get("/api/health")
 async def health():
-    return {"status": "online", "name": "JARVIS", "version": "0.1.0"}
+    return {"status": "ok", "name": "JARVIS", "version": "0.1.0"}
 
 
-@app.get("/api/tts-test")
+
+@app.get("/api/tts-test", dependencies=[Depends(require_auth)])
 async def tts_test():
     """Generate a test audio clip for debugging."""
     audio, fmt = await synthesize_speech("Testing audio, sir.")
-    if audio:
-        return {"audio": base64.b64encode(audio).decode(), "format": fmt}
-    return {"audio": None, "error": "TTS failed"}
+    if not audio:
+        return {"audio": None, "error": "TTS failed"}
+    return {"audio": base64.b64encode(audio).decode(), "format": fmt}
 
 
 @app.get("/api/usage")
@@ -2067,6 +2133,8 @@ async def voice_handler(ws: WebSocket):
                         audio_msg = _build_audio_message(audio_bytes, fmt, greeting)
                         if audio_msg:
                             await ws.send_json(audio_msg)
+                    else:
+                        await ws.send_json({"type": "text", "text": greeting})
                     history.append({"role": "assistant", "content": greeting})
                     log.info("JARVIS: %s", greeting)
                 except Exception as e:

@@ -1,0 +1,15 @@
+[32mINFO[0m:     Started server process [[36m31116[0m]
+[32mINFO[0m:     Waiting for application startup.
+2026-06-06 10:16:26,234 [jarvis] Using Groq API for LLM
+2026-06-06 10:16:26,271 [jarvis] Context refresh thread started
+2026-06-06 10:16:26,271 [jarvis] JARVIS server starting
+[32mINFO[0m:     Application startup complete.
+[32mINFO[0m:     Uvicorn running on [1mhttp://0.0.0.0:8340[0m (Press CTRL+C to quit)
+[32mINFO[0m:     127.0.0.1:45820 - "WebSocket /ws/voice" [accepted]
+2026-06-06 10:16:57,349 [jarvis] Voice WebSocket connected
+[32mINFO[0m:     connection open
+2026-06-06 10:16:57,958 [httpx] HTTP Request: POST https://api.fish.audio/v1/tts "HTTP/1.1 401 Unauthorized"
+2026-06-06 10:16:57,959 [jarvis] TTS error: 401
+2026-06-06 10:16:57,959 [jarvis] JARVIS: Hola señor. Buenos días. Son las 10 y 16, señor.
+2026-06-06 10:17:13,964 [jarvis] Voice WebSocket disconnected
+[32mINFO[0m:     connection closed
