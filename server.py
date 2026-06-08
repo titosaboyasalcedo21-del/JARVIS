@@ -16,6 +16,7 @@ import logging
 import os
 import sys
 import time
+import re
 from pathlib import Path
 
 IS_MAC = platform.system() == "Darwin"
@@ -241,26 +242,41 @@ CONTEXTO ADICIONAL:
 # Weather (wttr.in)
 # ---------------------------------------------------------------------------
 
-_weather_cache: dict[str, Optional[str]] = {"fetched": False, "value": None}
-
+_weather_state = {
+    "value": None,
+    "expires": 0,
+    "fail_count": 0,
+    "next_retry": 0,
+}
 
 async def fetch_weather() -> str:
-    """Fetch current weather from wttr.in. Cached for the session."""
-    if _weather_cache["fetched"]:
-        return _weather_cache["value"] or "Weather data unavailable."
-    _weather_cache["fetched"] = True
+    """Fetch current weather from wttr.in. Cached with exponential backoff on failure."""
+    now = time.time()
+
+    if now < _weather_state["next_retry"]:
+        return _weather_state["value"] or "Weather data unavailable."
+
+    if _weather_state["value"] and now < _weather_state["expires"]:
+        return _weather_state["value"]
+
     try:
         async with httpx.AsyncClient(timeout=5.0) as http:
             resp = await http.get("https://wttr.in/?format=%l:+%C,+%t", headers={"User-Agent": "curl"})
             if resp.status_code == 200:
-                _weather_cache["value"] = resp.text.strip()
-                return _weather_cache["value"]
-    except httpx.HTTPError as e:
-        log.warning("Weather fetch failed: %s", e)
+                _weather_state["value"] = resp.text.strip()
+                _weather_state["expires"] = now + 1800
+                _weather_state["fail_count"] = 0
+                _weather_state["next_retry"] = 0
+                return _weather_state["value"]
     except Exception as e:
         log.warning("Weather fetch failed: %s", e)
-    _weather_cache["value"] = None
-    return "Weather data unavailable."
+
+    _weather_state["fail_count"] += 1
+    backoff = min(60 * (2 ** (_weather_state["fail_count"] - 1)), 1800)
+    _weather_state["next_retry"] = now + backoff
+    log.info(f"Weather retry en {backoff}s (intento {_weather_state['fail_count']})")
+
+    return _weather_state["value"] or "Weather data unavailable."
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +319,24 @@ class TaskRequest(BaseModel):
 # Claude Task Manager
 # ---------------------------------------------------------------------------
 
+BLOCKED_PATTERNS = [
+    r"rm\s+-rf",
+    r"sudo\s+",
+    r"chmod\s+777",
+    r">\s*/etc/",
+    r"curl.*\|.*sh",
+    r"wget.*\|.*sh",
+    r"nc\s+-",
+    r"python.*-c.*exec",
+]
+
+def validate_claude_prompt(prompt: str) -> tuple[bool, str]:
+    """Valida que el prompt no contenga patrones peligrosos."""
+    for pattern in BLOCKED_PATTERNS:
+        if re.search(pattern, prompt, re.IGNORECASE):
+            return False, f"Prompt bloqueado: contiene patrón peligroso ({pattern})"
+    return True, ""
+
 class ClaudeTaskManager:
     """Manages background claude -p subprocesses."""
 
@@ -334,6 +368,11 @@ class ClaudeTaskManager:
 
     async def spawn(self, prompt: str, working_dir: str = ".") -> str:
         """Spawn a claude -p subprocess. Returns task_id. Non-blocking."""
+        # Validates prompt for dangerous patterns before spawning
+        is_safe, reason = validate_claude_prompt(prompt)
+        if not is_safe:
+            raise ValueError(f"Prompt rechazado por seguridad: {reason}")
+
         active = await self.get_active_count()
         if active >= self._max_concurrent:
             raise RuntimeError(
@@ -414,7 +453,7 @@ class ClaudeTaskManager:
                 stderr=asyncio.subprocess.PIPE,
             )
 
-        await process.communicate()
+        self._processes[task.id] = process
         task.pid = process.pid
 
         # Monitor the output file for completion
@@ -431,9 +470,12 @@ class ClaudeTaskManager:
                     task.status = "completed"
                     break
         else:
+            process.kill()
+            await process.wait()
             task.status = "timed_out"
             task.error = f"Task timed out after {timeout}s"
 
+        self._processes.pop(task.id, None)
         task.completed_at = datetime.now()
 
         # Notify via WebSocket
@@ -691,6 +733,66 @@ async def classify_intent(text: str, client: anthropic.AsyncAnthropic) -> dict:
 
 
         return {"action": "chat", "target": text}
+
+# ---------------------------------------------------------------------------
+# Unified Response Sender (guarantees state reset)
+# ---------------------------------------------------------------------------
+
+async def send_response(websocket: WebSocket, text: str, audio: bytes = b"", fmt: str = "mp3") -> None:
+    """Send response complete and guarantee state reset to idle."""
+    try:
+        try:
+            await websocket.send_json({"type": "state", "state": "speaking"})
+        except Exception:
+            pass
+        if audio:
+            audio_msg = _build_audio_message(audio, fmt, text)
+            if audio_msg:
+                await websocket.send_json(audio_msg)
+        else:
+            await websocket.send_json({"type": "text", "text": text})
+    finally:
+        try:
+            await websocket.send_json({"type": "state", "state": "idle"})
+        except Exception:
+            pass
+
+
+def log_action(session_id: str, action: str, target: str, result: str, duration_ms: float):
+    """Log action with session ID for traceability."""
+    log.info(json.dumps({
+        "event": "action",
+        "session": session_id,
+        "action": action,
+        "target": target[:100] if target else "",
+        "result": result,
+        "duration_ms": round(duration_ms, 1),
+        "timestamp": time.time(),
+    }))
+
+# ---------------------------------------------------------------------------
+# Action Gate - Security layer for LLM actions
+# ---------------------------------------------------------------------------
+
+from action_gate import is_safe, needs_confirmation, is_dangerous
+
+async def execute_llm_action(action: dict, websocket: WebSocket, session: dict):
+    """Execute LLM action with security gate."""
+    action_name = action.get("action", "").lower()
+    target = action.get("target", "")
+
+    if is_dangerous(action_name):
+        log.warning(f"Acción peligrosa bloqueada: {action_name} {target}")
+        await send_response(websocket, "No puedo hacer eso, señor. Acción bloqueada por seguridad.")
+        return
+
+    if needs_confirmation(action_name, target):
+        session["pending_action"] = action
+        await send_response(websocket, f"¿Confirma que debo {action_name} {target[:50]}, señor?")
+        return
+
+    await _dispatch_action(action, websocket, session)
+
 # ---------------------------------------------------------------------------
 # Markdown Stripping for TTS
 # ---------------------------------------------------------------------------
@@ -1036,8 +1138,6 @@ async def _execute_prompt_project(project_name: str, prompt: str, work_session: 
                     else:
                         await ws.send_json({"type": "text", "text": msg})
                         log.info("Dispatch text fallback sent for %s", project_name)
-                except Exception as e:
-                    log.error("Dispatch audio send failed: %s", e)
                 except Exception as e:
                     log.error("Dispatch audio send failed: %s", e)
 
@@ -1617,7 +1717,7 @@ async def api_get_task(task_id: str):
     return {"task": task.to_dict()}
 
 
-@app.post("/api/tasks")
+@app.post("/api/tasks", dependencies=[Depends(require_auth)])
 async def api_create_task(req: TaskRequest):
     try:
         task_id = await task_manager.spawn(req.prompt, req.working_dir)
@@ -2068,7 +2168,10 @@ Write an updated summary in 2-4 sentences capturing the key topics, decisions, a
 # -- WebSocket Voice Handler -----------------------------------------------
 
 @app.websocket("/ws/voice")
-async def voice_handler(ws: WebSocket):
+async def voice_handler(ws: WebSocket, token: str = ""):
+    if not verify_token(token):
+        await ws.close(code=4001)
+        return
     """
     WebSocket protocol:
 
@@ -2081,6 +2184,9 @@ async def voice_handler(ws: WebSocket):
         {"type": "task_spawned", "task_id": "...", "prompt": "..."}
         {"type": "task_complete", "task_id": "...", "summary": "..."}
     """
+    session_id = make_request_id()
+    session_log = logging.getLogger(f"jarvis.session.{session_id}")
+    session_log.info(f"Nueva sesión WebSocket — {ws.client}")
     await ws.accept()
     task_manager.register_websocket(ws)
     history: list[dict] = []
