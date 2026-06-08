@@ -6,15 +6,15 @@ import asyncio
 import json
 import sys
 import os
+import ssl
 
-SERVER_PORT = 8340
+SERVER_PORT = 8000
 
 
 def speak_text(text: str):
     """Speak text using espeak (offline, reliable)."""
     import subprocess
     try:
-        # Deeper, more JARVIS-like voice
         subprocess.run(['espeak-ng', '-v', 'en-us', '-s', '150', '-p', '30', '-a', '40', text],
                       check=True, capture_output=True)
     except Exception:
@@ -25,11 +25,15 @@ async def voice_loop():
     """Main loop: send text to server, speak response."""
     import websockets
     
-    uri = f"ws://localhost:{SERVER_PORT}/ws/voice"
+    ssl_context = ssl.create_default_context()
+    ssl_context.check_hostname = False
+    ssl_context.verify_mode = ssl.CERT_NONE
+    
+    uri = f"wss://localhost:{SERVER_PORT}/ws/voice"
     
     print("JARVIS client connected. Type your message and press Enter...")
     
-    async with websockets.connect(uri) as ws:
+    async with websockets.connect(uri, ssl=ssl_context) as ws:
         # Get greeting
         async def listen_for_responses():
             async for msg in ws:

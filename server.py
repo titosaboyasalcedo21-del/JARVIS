@@ -77,6 +77,10 @@ from tracking import SuccessTracker
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 log = logging.getLogger("jarvis")
 
+def make_request_id() -> str:
+    """Generate a unique request ID."""
+    return str(uuid.uuid4())[:8]
+
 def _create_task(coro):
     task = asyncio.create_task(coro)
     def _on_done(t):

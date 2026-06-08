@@ -5,6 +5,10 @@ import platform
 import sys
 import json
 import subprocess
+import threading
+import queue
+import ssl
+from pathlib import Path
 
 if platform.system() == 'Linux' and 'PYWEBVIEW_GUI' not in os.environ:
     os.environ['PYWEBVIEW_GUI'] = 'qt'
@@ -15,9 +19,58 @@ except ImportError:
     print("pywebview is required to run the Linux overlay. Install it with: pip install pywebview")
     sys.exit(1)
 
-# STT disabled in the overlay.
-# Voice input is handled ONLY by desktop-overlay/voice_client.py (stdin -> /ws/voice).
-HAS_VOSK = False
+SERVER_PORT = 8000
+VOICE_QUEUE = queue.Queue()
+is_listening = False
+
+
+def speak_text(text: str):
+    import subprocess
+    try:
+        subprocess.run(['espeak-ng', '-v', 'es', '-s', '150', '-p', '40', text],
+                      check=True, capture_output=True)
+    except Exception:
+        print(f"JARVIS: {text}")
+
+
+def vosk_listener():
+    """Background thread for continuous Vosk recognition."""
+    global is_listening
+    try:
+        from vosk import Model, KaldiRecognizer
+        import pyaudio
+        
+        model = Model(str(Path(__file__).parent.parent / "models" / "vosk-model-small-es-0.42"))
+        rec = KaldiRecognizer(model, 16000)
+        p = pyaudio.PyAudio()
+        stream = p.open(format=pyaudio.paInt16, channels=1, rate=16000, input=True, frames_per_buffer=8192)
+        stream.start_stream()
+        
+        wake_words = ['hola jarvis', 'jarvis estás ahí', 'jarvis estas ahi', 'hey jarvis', 'ok jarvis']
+        
+        while is_listening:
+            data = stream.read(4096, exception_on_overflow=False)
+            if rec.AcceptWaveform(data):
+                result = json.loads(rec.Result())
+                text = result.get('text', '').lower()
+                if any(w in text for w in wake_words):
+                    VOICE_QUEUE.put(text)
+                    speak_text("Sí, señor")
+    except Exception as e:
+        print(f"Vosk error: {e}")
+
+
+def start_vosk():
+    global is_listening
+    if is_listening:
+        return
+    is_listening = True
+    threading.Thread(target=vosk_listener, daemon=True).start()
+
+
+def stop_vosk():
+    global is_listening
+    is_listening = False
 
 
 HTML_TEMPLATE = """
@@ -27,38 +80,69 @@ HTML_TEMPLATE = """
 <meta charset="utf-8" />
 <title>JARVIS Overlay</title>
 <style>
-  html, body {
-    width: 100%;
-    height: 100%;
-    margin: 0;
-    padding: 0;
-    overflow: hidden;
-    background: transparent;
-    user-select: none;
-  }
-  canvas {
-    display: block;
-    width: 100%;
-    height: 100%;
-  }
-  #label {
-    position: absolute;
-    left: 50%;
-    bottom: 24px;
-    transform: translateX(-50%);
-    color: rgba(224, 240, 255, 0.88);
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-    font-size: 0.95rem;
-    letter-spacing: 0.05em;
-    text-shadow: 0 0 16px rgba(0, 0, 0, 0.4);
-    pointer-events: none;
-    opacity: 0.9;
-  }
+   html, body {
+     width: 100%;
+     height: 100%;
+     margin: 0;
+     padding: 0;
+     overflow: hidden;
+     background: transparent;
+     user-select: none;
+   }
+   canvas {
+     display: block;
+     width: 100%;
+     height: 100%;
+   }
+#label {
+      position: absolute;
+      left: 50%;
+      bottom: 24px;
+      transform: translateX(-50%);
+      color: rgba(224, 240, 255, 0.88);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 0.95rem;
+      letter-spacing: 0.05em;
+      text-shadow: 0 0 16px rgba(0, 0, 0, 0.4);
+      pointer-events: none;
+      opacity: 0.9;
+    }
+    #text-input {
+      position: absolute;
+      right: 60px;
+      bottom: 10px;
+      width: 180px;
+      background: rgba(10,10,20,0.6);
+      border: 1px solid rgba(76,168,232,0.4);
+      border-radius: 4px;
+      color: #e0e0ff;
+      font-family: sans-serif;
+      font-size: 0.85rem;
+      padding: 4px 8px;
+      outline: none;
+    }
+    #mic-btn {
+      position: absolute;
+      right: 10px;
+      bottom: 10px;
+      width: 40px;
+      height: 28px;
+      background: rgba(76,168,232,0.3);
+      border: 1px solid rgba(76,168,232,0.6);
+      border-radius: 4px;
+      color: #fff;
+      cursor: pointer;
+      font-size: 0.9rem;
+    }
+    #mic-btn.listening { background: rgba(255,60,60,0.6); }
 </style>
 </head>
 <body>
 <canvas id="orb"></canvas>
 <div id="label">JARVIS</div>
+<input id="text-input" type="text" placeholder="Escribe y Enter..." autocomplete="off">
+<button id="mic-btn" title="Hablar">🎤</button>
+<button id="vosk-btn" title="Vosk continuo" style="position:absolute;right:110px;bottom:10px;width:40px;height:28px;background:rgba(76,168,232,0.3);border:1px solid rgba(76,168,232,0.6);border-radius:4px;color:#fff;cursor:pointer;font-size:0.9rem;">🔊</button>
 <script type="importmap">
 {"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js"}}
 </script>
@@ -67,6 +151,29 @@ import * as THREE from 'three';
 
 const wsUrl = '__WS_URL__';
 let state = 'listening';
+let recognition = null;
+let isListening = false;
+
+// Web Speech API setup
+function setupSpeechRecognition() {
+    if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        recognition = new SpeechRecognition();
+        recognition.lang = 'es-ES';
+        recognition.interimResults = false;
+        recognition.maxAlternatives = 1;
+        
+        recognition.onresult = (event) => {
+            const text = event.results[0][0].transcript.trim();
+            if (text && window.jarvisSocket && window.jarvisSocket.readyState === WebSocket.OPEN) {
+                window.jarvisSocket.send(JSON.stringify({type: 'transcript', text: text, isFinal: true}));
+            }
+        };
+        
+        recognition.onerror = (e) => console.warn('Speech error:', e.error);
+        recognition.onend = () => { isListening = false; };
+    }
+}
 
 const canvas = document.getElementById('orb');
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
@@ -229,30 +336,125 @@ function connectSocket() {
    if (!wsUrl) return;
    try {
      const socket = new WebSocket(wsUrl);
+     window.jarvisSocket = socket;
      socket.onopen = () => {
        console.log('JARVIS overlay connected');
      };
-     socket.onmessage = (e) => {
-       try {
-         const msg = JSON.parse(e.data);
-         if (msg.type === 'status' && msg.state) {
-           state = msg.state;
-         }
+socket.onmessage = (e) => {
+        try {
+          const msg = JSON.parse(e.data);
+          if (msg.type === 'status' && msg.state) {
+            state = msg.state;
+          }
+          if (msg.type === 'audio' && msg.data) {
+            const audio = new Audio('data:audio/mp3;base64,' + msg.data);
+            audio.play().catch(() => {});
+          }
+          if (msg.type === 'text' && msg.text && !msg.state) {
+            // Also speak text if no audio available
+            speakText(msg.text);
+          }
         } catch (err) {
-         console.warn('Invalid overlay ws message', err);
-       }
-     };
+          console.warn('Invalid overlay ws message', err);
+        }
+      };
+      
+      window.speakText = function(text) {
+        if ('speechSynthesis' in window) {
+            speechSynthesis.speak(new SpeechSynthesisUtterance(text));
+        }
+      };
      socket.onclose = () => setTimeout(connectSocket, 2000);
      socket.onerror = () => {};
    } catch (err) {
      console.warn('Overlay socket failed', err);
      setTimeout(connectSocket, 3000);
    }
-}
+ }
 
 connectSocket();
 resize();
 animate();
+
+// Handle text input - send to WebSocket
+const textInput = document.getElementById('text-input');
+textInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+        const text = textInput.value.trim();
+        if (text) {
+            // Send via WebSocket if available
+            if (window.jarvisSocket && window.jarvisSocket.readyState === WebSocket.OPEN) {
+                window.jarvisSocket.send(JSON.stringify({type: 'transcript', text: text, isFinal: true}));
+            }
+            textInput.value = '';
+        }
+    }
+});
+
+// Wake word detection - respond immediately
+let wakeWords = ['hola jarvis', 'jarvis estás ahí', 'jarvis estas ahi', 'hey jarvis', 'ok jarvis'];
+
+function checkWakeWord(text) {
+    const lowerText = text.toLowerCase();
+    return wakeWords.some(w => lowerText.includes(w));
+}
+
+// Microphone button with wake word
+const micBtn = document.getElementById('mic-btn');
+if (micBtn) {
+    setupSpeechRecognition();
+    micBtn.addEventListener('click', () => {
+        if (!recognition) {
+            alert('Reconocimiento de voz no disponible');
+            return;
+        }
+        if (isListening) {
+            recognition.stop();
+            isListening = false;
+            micBtn.classList.remove('listening');
+        } else {
+            recognition.start();
+            isListening = true;
+            micBtn.classList.add('listening');
+        }
+    });
+}
+
+// Continuous listening for wake word
+function startContinuousListening() {
+    if (!recognition) return;
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.onresult = (event) => {
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+            if (event.results[i].isFinal) {
+                const transcript = event.results[i][0].transcript.trim();
+                if (checkWakeWord(transcript)) {
+                    // Send wake word trigger
+                    if (window.jarvisSocket && window.jarvisSocket.readyState === WebSocket.OPEN) {
+                        window.jarvisSocket.send(JSON.stringify({type: 'transcript', text: transcript, isFinal: true}));
+                    }
+                }
+            }
+        }
+    };
+    recognition.onend = () => {
+        if (isListening) recognition.start();
+    };
+}
+
+// Start continuous listening automatically
+startContinuousListening();
+
+// Expose sendTextToJARVIS for Python stdin
+window.sendTextToJARVIS = function(text) {
+    const input = document.getElementById('text-input');
+    if (input) {
+        input.value = text;
+        const event = new KeyboardEvent('keydown', {'key': 'Enter'});
+        input.dispatchEvent(event);
+    }
+};
 </script>
 </body>
 </html>
@@ -311,10 +513,32 @@ def main() -> int:
     except TypeError:
         pass
 
-    window.events.closed += lambda: None
-    
     webview.start(debug=False)
     return 0
+
+
+def send_text_to_js(text):
+    for w in webview.windows:
+        if w.title == 'JARVIS':
+            try:
+                w.evaluate_js(f'sendVoiceText && sendVoiceText("{text.replace(chr(34), chr(92)+chr(34))}")')
+            except:
+                pass
+
+
+def voice_queue_poller():
+    import time
+    while True:
+        try:
+            text = VOICE_QUEUE.get(timeout=0.1)
+            if text:
+                send_text_to_js(text)
+        except queue.Empty:
+            pass
+        time.sleep(0.05)
+
+
+threading.Thread(target=voice_queue_poller, daemon=True).start()
 
 
 if __name__ == '__main__':
