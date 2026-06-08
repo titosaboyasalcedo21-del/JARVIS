@@ -21,6 +21,17 @@ from pathlib import Path
 
 IS_MAC = platform.system() == "Darwin"
 IS_LINUX = platform.system() == "Linux"
+ACTION_KEYWORDS = {
+    "browse": ["search for", "look up", "google", "find online", "busca", "buscar"],
+    "build": ["create", "build", "make", "crea", "construye"],
+    "research": ["research", "investigate", "investiga"],
+    "open_terminal": ["terminal", "consola"],
+    "run_python": ["run", "execute", "ejecuta"],
+    "screen": ["screenshot", "pantalla", "mira"],
+    "remember": ["remember", "recuerda", "save"],
+    "add_task": ["task", "tarea", "todo"],
+}
+
 
 # Load .env file if present
 _env_path = Path(__file__).parent / ".env"
