@@ -1651,6 +1651,16 @@ return windowList
 @asynccontextmanager
 async def lifespan(application: FastAPI):
     global anthropic_client, cached_projects
+    # Validate configuration
+    if not ANTHROPIC_API_KEY and not GROQ_API_KEY:
+        log.error("Neither ANTHROPIC_API_KEY nor GROQ_API_KEY is set")
+    if not FISH_API_KEY:
+        log.warning("FISH_API_KEY not set - TTS disabled")
+    cert_file = Path(__file__).parent / "cert.pem"
+    key_file = Path(__file__).parent / "key.pem"
+    if not cert_file.exists() or not key_file.exists():
+        log.info("SSL certificates not found (optional). Generate with: openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes -subj '/CN=localhost'")
+
     if GROQ_API_KEY:
         log.info("Using Groq API for LLM")
         anthropic_client = GroqWrapper(api_key=GROQ_API_KEY)
