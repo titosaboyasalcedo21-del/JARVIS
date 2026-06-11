@@ -479,8 +479,8 @@ class ClaudeTaskManager:
         while time.time() - start < timeout:
             await asyncio.sleep(5)
             if output_file.exists():
-                content = output_file.read_text()
-                if "--- JARVIS TASK COMPLETE ---" in content or len(content) > 100:
+                content = output_file.read_text(errors="ignore")
+                if "--- JARVIS TASK COMPLETE ---" in content:
                     task.result = content.replace("--- JARVIS TASK COMPLETE ---", "").strip()
                     task.status = "completed"
                     break
@@ -2248,6 +2248,7 @@ async def voice_handler(ws: WebSocket, token: str = ""):
 
             async def _send_greeting():
                 try:
+                    # If client disconnects while we're speaking, WebSocket sends will fail.
                     audio_bytes, fmt = await synthesize_speech(greeting)
                     if audio_bytes:
                         await ws.send_json({"type": "status", "state": "speaking"})
@@ -2259,8 +2260,10 @@ async def voice_handler(ws: WebSocket, token: str = ""):
                     history.append({"role": "assistant", "content": greeting})
                     log.info("JARVIS: %s", greeting)
                 except Exception as e:
-                    log.warning("Greeting failed: %s", e)
+                    # Client might have closed the connection; don't crash the WS handler.
+                    log.debug("Greeting send failed (likely disconnected): %s", e)
 
+            # Send greeting in background but never let failures crash the connection.
             _create_task(_send_greeting())
 
         try:

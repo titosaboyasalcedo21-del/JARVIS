@@ -62,10 +62,20 @@ async def _mark_terminal_as_jarvis(revert_after: float = 5.0):
 
         # Schedule revert
         if original_profile and original_profile != "Ocean":
-            asyncio.get_event_loop().call_later(
-                revert_after,
-                lambda: asyncio.ensure_future(_revert_terminal_theme(original_profile))
-            )
+            async def _revert_later():
+                await asyncio.sleep(revert_after)
+                await _revert_terminal_theme(original_profile)
+
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(_revert_later())
+            except RuntimeError:
+                # Fallback when called without a running loop
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.create_task(_revert_later())
+                loop.run_until_complete(asyncio.sleep(revert_after + 0.1))
+                loop.close()
     except Exception:
         pass
 
