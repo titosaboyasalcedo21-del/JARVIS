@@ -70,14 +70,13 @@ async def _mark_terminal_as_jarvis(revert_after: float = 5.0):
                 loop = asyncio.get_running_loop()
                 loop.create_task(_revert_later())
             except RuntimeError:
-                # Fallback when called without a running loop
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 loop.create_task(_revert_later())
                 loop.run_until_complete(asyncio.sleep(revert_after + 0.1))
                 loop.close()
-    except Exception:
-        pass
+    except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
+        log.debug("Terminal theme marking failed: %s", e)
 
 
 async def _revert_terminal_theme(profile_name: str):
@@ -97,8 +96,8 @@ async def _revert_terminal_theme(profile_name: str):
             stderr=asyncio.subprocess.PIPE,
         )
         await proc.communicate()
-    except Exception:
-        pass
+    except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
+        log.debug("Terminal revert failed: %s", e)
 
 
 async def open_terminal(command: str = "") -> dict:
@@ -368,8 +367,8 @@ async def get_chrome_tab_info() -> dict:
             result = stdout.decode().strip()
             parts = result.split("|", 1)
             if len(parts) == 2: return {"title": parts[0], "url": parts[1]}
-    except:
-        pass
+    except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
+        log.debug("Chrome tab info failed: %s", e)
     return {}
 
 
@@ -395,8 +394,8 @@ async def monitor_build(project_dir: str, ws=None, synthesize_fn=None) -> None:
                             if audio_msg:
                                 await ws.send_json(audio_msg)
                             await ws.send_json({"type": "status", "state": "idle"})
-                    except:
-                        pass
+                    except (Exception,) as e:
+                        log.debug("Build completion notification failed: %s", e)
                 return
     log.warning(f"Build timed out in {project_dir}")
 

@@ -18,6 +18,7 @@ import sys
 import time
 import re
 from pathlib import Path
+from typing import Optional, Any
 
 IS_MAC = platform.system() == "Darwin"
 IS_LINUX = platform.system() == "Linux"
@@ -264,6 +265,8 @@ _weather_state = {
     "next_retry": 0,
 }
 
+WEATHER_LOCATION = os.getenv("WEATHER_LOCATION", "")
+
 async def fetch_weather() -> str:
     """Fetch current weather from wttr.in. Cached with exponential backoff on failure."""
     now = time.time()
@@ -276,7 +279,8 @@ async def fetch_weather() -> str:
 
     try:
         async with httpx.AsyncClient(timeout=5.0) as http:
-            resp = await http.get("https://wttr.in/?format=%l:+%C,+%t", headers={"User-Agent": "curl"})
+            location_param = f"~{WEATHER_LOCATION}" if WEATHER_LOCATION else ""
+            resp = await http.get(f"https://wttr.in/{location_param}?format=%l:+%C,+%t", headers={"User-Agent": "curl"})
             if resp.status_code == 200:
                 _weather_state["value"] = resp.text.strip()
                 _weather_state["expires"] = now + 1800
@@ -1408,32 +1412,47 @@ class GroqWrapper:
     def __init__(self, api_key: str):
         self.client = groq.AsyncGroq(api_key=api_key)
         self.messages = self
+        self.max_retries = 3
+        self.retry_delay = 1
 
-    async def create(self, model, max_tokens, system, messages):
-        # Map Claude models to high-performance Groq models
+    async def create(self, model, max_tokens, system, messages, temperature=0.7):
         model_map = {
             "claude-3-5-sonnet-20241022": "llama-3.3-70b-specdec",
             "claude-haiku-4-5-20251001": "llama-3.1-8b-instant",
         }
         actual_model = model_map.get(model, "llama-3.3-70b-specdec")
-        
-        # Combine system and user messages for Groq
         combined_messages = [{"role": "system", "content": system}] + messages
-        
-        resp = await self.client.chat.completions.create(
-            model=actual_model,
-            messages=combined_messages,
-            max_tokens=max_tokens,
-            temperature=0.0
-        )
-        
-        # Mimic Anthropic response object structure
-        class TextBlock:
-            def __init__(self, t): self.text = t
-        class MsgResp:
-            def __init__(self, t): self.content = [TextBlock(t)]
-        
-        return MsgResp(resp.choices[0].message.content)
+
+        for attempt in range(self.max_retries):
+            try:
+                resp = await self.client.chat.completions.create(
+                    model=actual_model,
+                    messages=combined_messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                )
+                class TextBlock:
+                    def __init__(self, t): self.text = t
+                class MsgResp:
+                    def __init__(self, t): self.content = [TextBlock(t)]
+                return MsgResp(resp.choices[0].message.content)
+            except groq.RateLimitError as e:
+                if attempt < self.max_retries - 1:
+                    delay = self.retry_delay * (2 ** attempt)
+                    log.warning(f"Groq rate limit, retrying in {delay}s")
+                    await asyncio.sleep(delay)
+                else:
+                    log.error(f"Groq rate limit after {self.max_retries} attempts")
+                    raise
+            except groq.APIError as e:
+                log.error(f"Groq API error (attempt {attempt+1}): {e}")
+                if attempt < self.max_retries - 1:
+                    await asyncio.sleep(self.retry_delay * (2 ** attempt))
+                else:
+                    raise
+            except Exception as e:
+                log.error(f"Groq unexpected error: {e}")
+                raise
 cached_projects: list[dict] = []
 recently_built: list[dict] = []  # [{"name": str, "path": str, "time": float}]
 dispatch_registry = DispatchRegistry()
@@ -2940,18 +2959,26 @@ async def api_transcribe(file: UploadFile = File(...)):
     """Transcribe audio using Groq Whisper for instantaneous flawless STT."""
     try:
         content = await file.read()
+        if not content or len(content) == 0:
+            return {"text": ""}
         audio_file = ("audio.webm", content, "audio/webm")
         client = groq.AsyncGroq(api_key=GROQ_API_KEY)
-        response = await client.audio.transcriptions.create(
-            file=audio_file,
-            model="whisper-large-v3-turbo",
-prompt="El usuario está hablando. Comando para JARVIS.",
-            response_format="json",
-            language=os.getenv("STT_LANGUAGE", "es"),
-
-            temperature=0.0
-        )
-        return {"text": response.text}
+        try:
+            response = await asyncio.wait_for(
+                client.audio.transcriptions.create(
+                    file=audio_file,
+                    model="whisper-large-v3-turbo",
+                    prompt="El usuario está hablando. Comando para JARVIS.",
+                    response_format="json",
+                    language=os.getenv("STT_LANGUAGE", "es"),
+                    temperature=0.0
+                ),
+                timeout=30.0
+            )
+            return {"text": response.text}
+        except asyncio.TimeoutError:
+            log.error("Whisper transcription timeout (>30s)")
+            return {"text": ""}
     except Exception as e:
         log.error("Whisper transcription failed: %s", e)
         return {"text": ""}
@@ -3010,21 +3037,40 @@ if FRONTEND_DIST.exists():
 # Entrypoint
 # ---------------------------------------------------------------------------
 
+def validate_config():
+    """Validate all required environment variables at startup."""
+    errors = []
+    if not ANTHROPIC_API_KEY and not GROQ_API_KEY:
+        errors.append("Neither ANTHROPIC_API_KEY nor GROQ_API_KEY is set")
+    if not FISH_API_KEY:
+        errors.append("FISH_API_KEY is required for TTS")
+    cert_file = Path(__file__).parent / "cert.pem"
+    key_file = Path(__file__).parent / "key.pem"
+    if not cert_file.exists() or not key_file.exists():
+        log.info("SSL certificates not found (optional). For HTTPS: openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes -subj '/CN=localhost'")
+    if errors:
+        log.error("Configuration errors:")
+        for error in errors:
+            log.error(f"   - {error}")
+        sys.exit(1)
+    log.info("Configuration validated")
+
 if __name__ == "__main__":
     import argparse
     import uvicorn
 
     parser = argparse.ArgumentParser(description="JARVIS Server")
-    parser.add_argument("--host", default="0.0.0.0", help="Bind host")
-    parser.add_argument("--port", type=int, default=8340, help="Bind port")
+    parser.add_argument("--host", default=os.getenv("JARVIS_HOST", "127.0.0.1"), help="Bind host")
+    parser.add_argument("--port", type=int, default=int(os.getenv("JARVIS_PORT", "8340")), help="Bind port")
     parser.add_argument("--reload", action="store_true", help="Auto-reload on changes")
-    parser.add_argument("--ssl", action="store_true", help="Enable HTTPS with key.pem/cert.pem")
+    parser.add_argument("--no-ssl", action="store_true", help="Disable SSL/TLS")
     args = parser.parse_args()
+    validate_config()
 
     # Auto-detect SSL certs
     cert_file = Path(__file__).parent / "cert.pem"
     key_file = Path(__file__).parent / "key.pem"
-    use_ssl = args.ssl or (cert_file.exists() and key_file.exists())
+    use_ssl = not args.no_ssl and (cert_file.exists() and key_file.exists())
 
     proto = "https" if use_ssl else "http"
     ws_proto = "wss" if use_ssl else "ws"

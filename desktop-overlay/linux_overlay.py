@@ -19,18 +19,12 @@ except ImportError:
     print("pywebview is required to run the Linux overlay. Install it with: pip install pywebview")
     sys.exit(1)
 
+import logging
+log = logging.getLogger("jarvis.overlay")
+
 SERVER_PORT = 8000
 VOICE_QUEUE = queue.Queue()
 is_listening = False
-
-
-def speak_text(text: str):
-    import subprocess
-    try:
-        subprocess.run(['espeak-ng', '-v', 'es', '-s', '150', '-p', '40', text],
-                      check=True, capture_output=True)
-    except Exception:
-        print(f"JARVIS: {text}")
 
 
 def vosk_listener():
@@ -467,12 +461,15 @@ def build_html(ws_url: str) -> str:
 
 def speak_text(text: str):
     """Speak using festival/espeak (offline)."""
+    import subprocess
     try:
-        subprocess.run(['festival', '--tts'], input=text.encode(), check=True)
-    except:
+        subprocess.run(['festival', '--tts'], input=text.encode(), check=True, timeout=5)
+    except (FileNotFoundError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as e:
+        log.debug("Festival TTS failed: %s", e)
         try:
-            subprocess.run(['espeak-ng', '-v', 'en-us', '-s', '150', text], check=True)
-        except:
+            subprocess.run(['espeak-ng', '-v', 'en-us', '-s', '150', text], check=True, timeout=3)
+        except (FileNotFoundError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as e:
+            log.debug("espeak-ng TTS failed: %s", e)
             print(f"JARVIS: {text}")
 
 

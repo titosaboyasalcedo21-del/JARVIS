@@ -22,7 +22,9 @@ async def _run_notes_script(script: str, timeout: float = 10) -> str:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         if proc.returncode != 0: return ""
         return stdout.decode().strip()
-    except: return ""
+    except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
+        log.debug("Notes script failed: %s", e)
+        return ""
 
 
 async def get_recent_notes(count: int = 10) -> list[dict]:
@@ -57,7 +59,8 @@ end tell
             for f in files:
                 mtime = datetime.fromtimestamp(f.stat().st_mtime).strftime('%Y-%m-%d %H:%M')
                 notes.append({"title": f.stem, "date": mtime, "folder": "Local"})
-        except: pass
+        except (OSError, PermissionError) as e:
+            log.debug("Notes file listing failed: %s", e)
         return notes
 
 
@@ -83,7 +86,8 @@ end tell
             for f in NOTES_DIR.glob("*.md"):
                 if title_match.lower() in f.stem.lower():
                     return {"title": f.stem, "body": f.read_text()}
-        except: pass
+        except (OSError, PermissionError) as e:
+            log.debug("Note read failed: %s", e)
         return None
 
 
@@ -121,7 +125,8 @@ end tell
                     mtime = datetime.fromtimestamp(f.stat().st_mtime).strftime('%Y-%m-%d %H:%M')
                     notes.append({"title": f.stem, "date": mtime})
                     if len(notes) >= count: break
-        except: pass
+        except (OSError, PermissionError) as e:
+            log.debug("Notes search failed: %s", e)
         return notes
 
 
@@ -140,7 +145,9 @@ async def create_local_note(title: str, body: str, folder: str = "Notes") -> boo
             filepath.write_text(body)
             log.info(f"Created local note: {filepath}")
             return True
-        except: return False
+        except (OSError, PermissionError) as e:
+            log.warning(f"Note creation failed: {e}")
+            return False
 
 
 def _body_to_html(body: str) -> str:
